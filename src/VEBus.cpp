@@ -346,6 +346,23 @@ void VEBus::_processRx()
 // -----------------------------------------------------------------------
 void VEBus::_sendCommand(const VEBusCmd &cmd)
 {
+#ifdef VEBUS_READ_ONLY
+    // Deny by default at the only protocol transmit path, including boot,
+    // periodic ESS refresh, UPS, MQTT and no-sync recovery commands.
+    switch (cmd.type) {
+    case VEBUS_CMD_READ_RAM:
+    case VEBUS_CMD_READ_RAM_VARS:
+    case VEBUS_CMD_READ_SETTING:
+    case VEBUS_CMD_GET_DEVICE_STATE:
+    case VEBUS_CMD_GET_VERSION_0:
+    case VEBUS_CMD_GET_VERSION_1:
+    case VEBUS_CMD_GET_SETTING_INFO:
+    case VEBUS_CMD_GET_RAMVAR_INFO:
+        break;
+    default:
+        return;
+    }
+#endif
     int len;
     byte fn = (_frameNr + 1) & 0x7F;
 
@@ -765,10 +782,19 @@ void VEBus::_decodeFrame(const char *frame, int len)
             // --- RAM var info responses (0x8E-0x8F) ---
             case VEBUS_WRESP_RAMVAR_SCALE:
                 _ramVarInfoScale = (int16_t)(256 * (uint8_t)frame[8] + (uint8_t)frame[7]);
+                if (_ramVarInfoScale == 0) {
+                    _ramVarInfoOffset = 0; // unsupported: no offset follows
+                    _gotRAMVarInfo = true;
+                }
                 // Scale and offset normally arrive in one frame: 8E sc sc 8F of of
                 if (len > 11 && (byte)frame[9] == VEBUS_WRESP_RAMVAR_OFFSET)
                 {
                     _ramVarInfoOffset = (int16_t)(256 * (uint8_t)frame[11] + (uint8_t)frame[10]);
+                    _gotRAMVarInfo = true;
+                }
+                else if (len > 10 && (byte)frame[9] != VEBUS_WRESP_RAMVAR_OFFSET) {
+                    // Long format: 8E sc sc offsetLo offsetHi (no 8F marker).
+                    _ramVarInfoOffset = (int16_t)(256 * (uint8_t)frame[10] + (uint8_t)frame[9]);
                     _gotRAMVarInfo = true;
                 }
                 break;

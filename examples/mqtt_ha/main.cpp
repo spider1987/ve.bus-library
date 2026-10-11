@@ -33,6 +33,10 @@
 #include <stdarg.h>
 #include <VEBus.h>
 #include "web_ui.h"
+#include "AcEnergy.h"
+#include "BatteryEnergy.h"
+#include "StatusLed.h"
+#include <Adafruit_NeoPixel.h>
 #include <VEBusScaler.h>           // optional: raw RAM values → real units
 #include <VEBusUps.h>              // optional UPS add-ons of the library
 #include <VEBusNutServer.h>
@@ -66,6 +70,21 @@
 #define VEBUS_PIN_TX   22
 #define VEBUS_PIN_RE   17
 #define VEBUS_PIN_SHDN 19
+#define VEBUS_PIN_POWER 16  // ME2107: RS485/CAN transceiver supply enable
+
+// T-CAN485 WS2812B, GPIO4; library uses ESP32 RMT to preserve UART timing.
+static Adafruit_NeoPixel statusPixel(1, 4, NEO_GRB + NEO_KHZ800);
+static LedStatus ledStatus = LedStatus::Startup;
+static uint32_t ledSince = 0, ledLastRgb = UINT32_MAX;
+static bool ledUpdating = false;
+static void showStatusLed(LedStatus state, uint32_t now) {
+    if (state != ledStatus) { ledStatus = state; ledSince = now; }
+    const uint32_t rgb = statusLedRGB(state, now - ledSince);
+    if (rgb == ledLastRgb) return; // only transmit to WS2812 on a visible change
+    statusPixel.setPixelColor(0, rgb);
+    statusPixel.show();
+    ledLastRgb = rgb;
+}
 
 // Timing
 #define PUBLISH_INTERVAL_MS  5000
@@ -125,6 +144,43 @@ char hostName[32];              // deviceId sanitised for DHCP / mDNS
 // Live values from the extended RAM reads (real units) — stored in the UPS
 // helper so NUT/apcupsd see them too.
 VEBusUpsData &live = ups.data;
+
+// Manual AC-IN measurement. RAM only; browser disconnect does not stop it.
+static AcEnergy acEnergy;
+static BatteryEnergy batEnergy;
+static bool batHaveSample = false;
+static uint32_t batSampleMs = 0;
+static float batSampleV = 0, batSampleA = 0;
+static bool acRunning = false, acStarted = false, acInvert = false;
+static bool acHaveMains = false;
+static uint32_t acMainsMs = 0, acStartMs = 0, acStopMs = 0, acRowMs = 0;
+struct AcRow { uint32_t elapsedS, measuredS; float watts, importWh, exportWh;
+    uint32_t batMeasuredS; float batV, batA, batW, batChargeWh, batDischargeWh; };
+static const uint16_t AC_ROWS = 1440;
+static AcRow *acRows = nullptr; // large CSV ring belongs in heap, not static DRAM
+static uint16_t acHead = 0, acCount = 0;
+static uint32_t acRowsTotal = 0;
+static bool acFresh(uint32_t now) {
+    return acHaveMains && !vebus.hasNoSync() && now - acMainsMs <= 10000;
+}
+static bool batFresh(uint32_t now) {
+    return batHaveSample && !vebus.hasNoSync() && now - batSampleMs <= 10000;
+}
+static void acRecord(uint32_t now) {
+    if (!acRows) return;
+    acRows[acHead] = { (now - acStartMs) / 1000, acEnergy.measuredMs / 1000,
+                      acFresh(now) ? live.mainsW * (acInvert ? -1 : 1) : NAN,
+                      (float)acEnergy.importWh, (float)acEnergy.exportWh,
+                      batEnergy.measuredMs / 1000,
+                      batFresh(now) ? batSampleV : NAN, batFresh(now) ? batSampleA : NAN,
+                      batFresh(now) ? batSampleV * batSampleA : NAN,
+                      (float)batEnergy.importWh, (float)batEnergy.exportWh };
+    acHead = (acHead + 1) % AC_ROWS;
+    if (acCount < AC_ROWS) ++acCount;
+    ++acRowsTotal;
+    acRowMs = now;
+}
+
 
 int16_t  g_essPower       = 0;
 uint32_t g_lastEssCmdMs   = 0;
@@ -355,6 +411,10 @@ static void onPortalSave()
 // =======================================================================
 static bool handleCommand(const char *cmd, const char *arg, const char *src)
 {
+#ifdef VEBUS_READ_ONLY
+    Serial.printf("[read-only] blocked control from %s: %s\n", src, cmd);
+    return false;
+#endif
     if (!strcmp(cmd, "ess_power")) {
         int16_t w = (int16_t)constrain(atoi(arg), -1875, 1875);
         if (w != g_essPower) g_essDirty = true;
@@ -376,6 +436,22 @@ static bool handleCommand(const char *cmd, const char *arg, const char *src)
         if (on != vebus.isVirtualSetpointMode()) g_essDirty = true;
         vebus.enableVirtualSetpointMode(on);
         Serial.printf("[%s] Virtual mode → %s\n", src, on ? "ON" : "OFF");
+    }
+    else if (!strcmp(cmd, "sync_soc")) {
+        // Manual known-reference SoC only; never run on boot/reconnect.
+        // RAM 13 is SoC, scaled at 0.5 percent per raw unit.
+        if (strcmp(src, "web") || !batFresh(millis()) || !arg[0]) return false;
+        for (const char *p = arg; *p; ++p) if (*p < '0' || *p > '9') return false;
+        if (strlen(arg) > 3) return false;
+        const unsigned percent = (unsigned)atoi(arg);
+        if (percent > 100) return false;
+        const float raw = ((float)percent - scaler.info(VEBUS_RAM_CHARGE_STATE).offset) /
+                          scaler.info(VEBUS_RAM_CHARGE_STATE).scale;
+        if (!isfinite(raw) || raw < 0 || raw > 65535) return false;
+        vebus.writeRAMVar(VEBUS_RAM_CHARGE_STATE, (uint16_t)lroundf(raw));
+        // Do not overwrite live.soc: the UI must show device readback.
+        const uint8_t id = VEBUS_RAM_CHARGE_STATE;
+        vebus.readRAMVars(&id, 1);
     }
     else if (!strcmp(cmd, "wakeup"))           vebus.setSwitchState(VEBUS_SWITCH_STATE_ON);
     else if (!strcmp(cmd, "sleep"))            vebus.setSwitchState(VEBUS_SWITCH_STATE_OFF);
@@ -412,7 +488,12 @@ static void applyUpsConfig()
 // =======================================================================
 static void buildStateJson(Buf &j)
 {
-    j.add("{\"bat_volt\":%.2f,\"ac_power\":%d,\"dc_current\":%.1f,\"temp\":%.1f,",
+#ifdef VEBUS_READ_ONLY
+    j.add("{\"read_only\":true,");
+#else
+    j.add("{\"read_only\":false,");
+#endif
+    j.add("\"bat_volt\":%.2f,\"ac_power\":%d,\"dc_current\":%.1f,\"temp\":%.1f,",
           vebus.getBatVolt(), (int)vebus.getACPower(), vebus.getDCCurrent(), vebus.getTemp());
     j.add("\"charger_status\":%u,\"ess_power\":%d,\"ess_power_eff\":%d,\"virtual_mode\":\"%s\",",
           (unsigned)vebus.getChargerStatus(), (int)g_essPower,
@@ -695,6 +776,94 @@ static void handleHistory()
     server.sendContent("");
 }
 
+static void handleAcState() {
+    const uint32_t now = millis();
+    char buf[1024]; Buf j(buf, sizeof(buf));
+    const uint32_t elapsed = acStarted ? (acRunning ? now : acStopMs) - acStartMs : 0;
+    j.add("{\"running\":%s,\"started\":%s,\"fresh\":%s,\"inverted\":%s,",
+          acRunning ? "true" : "false", acStarted ? "true" : "false",
+          acFresh(now) ? "true" : "false", acInvert ? "true" : "false");
+    j.add("\"elapsed_s\":%lu,\"measured_s\":%lu,\"import_wh\":%.3f,\"export_wh\":%.3f,",
+          (unsigned long)(elapsed / 1000), (unsigned long)(acEnergy.measuredMs / 1000),
+          acEnergy.importWh, acEnergy.exportWh);
+    j.add("\"rows\":%u,\"rows_total\":%lu,\"power_w\":", acCount, (unsigned long)acRowsTotal);
+    if (acFresh(now)) j.add("%.1f", live.mainsW * (acInvert ? -1 : 1)); else j.add("null");
+    j.add(",\"setpoint_w\":%d,\"effective_w\":%d,\"virtual_mode\":%s,",
+          (int)g_essPower, (int)vebus.getEffectiveESSPower(),
+          vebus.isVirtualSetpointMode() ? "true" : "false");
+    j.add("\"battery_fresh\":%s,\"battery_measured_s\":%lu,\"battery_charge_kwh\":%.6f,\"battery_discharge_kwh\":%.6f,\"battery_power_w\":",
+          batFresh(now) ? "true" : "false", (unsigned long)(batEnergy.measuredMs / 1000),
+          batEnergy.importWh / 1000, batEnergy.exportWh / 1000);
+    if (batFresh(now)) j.add("%.1f", batSampleV * batSampleA); else j.add("null");
+    j.add(",\"read_only\":%s}",
+#ifdef VEBUS_READ_ONLY
+          "true"
+#else
+          "false"
+#endif
+    );
+    sendJson(buf);
+}
+static void handleAcControl() {
+    if (!checkAuth()) return;
+    const String action = server.arg("action");
+    const uint32_t now = millis();
+    if (action == "start") {
+        if (!acRows) { sendJson("{\"ok\":false,\"error\":\"Nicht genug Speicher fuer den Messlauf\"}", 503); return; }
+        if (acRunning) { sendJson("{\"ok\":false,\"error\":\"Messlauf läuft bereits\"}", 409); return; }
+        if (!acFresh(now) || !batFresh(now)) { sendJson("{\"ok\":false,\"error\":\"Frische AC-IN- und Batteriewerte erforderlich\"}", 409); return; }
+        acEnergy = AcEnergy(); acHead = acCount = 0; acRowsTotal = 0;
+        batEnergy = BatteryEnergy();
+        acInvert = server.arg("invert") == "1";
+        acStartMs = acRowMs = now; acStarted = acRunning = true;
+        // First energy interval starts with the next actual RAM response.
+        acRecord(now);
+    } else if (action == "power") {
+#ifdef VEBUS_READ_ONLY
+        sendJson("{\"ok\":false,\"error\":\"Read-only diagnosis: controls blocked\"}", 403); return;
+#endif
+        if (!acRunning || !acFresh(now)) {
+            sendJson("{\"ok\":false,\"error\":\"Leistungsvorgabe benötigt einen laufenden Messlauf und frische AC-IN-Werte\"}", 409); return;
+        }
+        const String power = server.arg("watts"), direction = server.arg("direction");
+        int16_t signedW = 0;
+        if ((direction != "charge" && direction != "discharge") ||
+            !acPowerValue(power.c_str(), direction == "charge", signedW)) {
+            sendJson("{\"ok\":false,\"error\":\"Ganzzahlige Leistung von 0 bis 1875 W und gültige Richtung erforderlich\"}", 400); return;
+        }
+        char value[8];
+        snprintf(value, sizeof(value), "%d", (int)signedW);
+        handleCommand("ess_power", value, "ac-test");
+    } else if (action == "stop") {
+        if (acRunning) { acStopMs = now; acRecord(now); acRunning = false; acEnergy.gap(); batEnergy.gap(); }
+    } else { sendJson("{\"ok\":false,\"error\":\"Unbekannte Messaktion\"}", 400); return; }
+    sendJson("{\"ok\":true}");
+}
+static void handleAcCsv() {
+    if (!checkAuth()) return;
+    server.sendHeader("Cache-Control", "no-store");
+    server.sendHeader("Content-Disposition", "attachment; filename=ac-in-messlauf.csv");
+    server.setContentLength(CONTENT_LENGTH_UNKNOWN);
+    server.send(200, "text/csv; charset=utf-8", "");
+    server.sendContent("elapsed_s;valid_measurement_s;ac_in_w;import_wh;export_wh;battery_valid_s;battery_voltage_v;battery_current_a;battery_power_w;battery_charge_kwh;battery_discharge_kwh\r\n");
+    const uint16_t first = (acHead + AC_ROWS - acCount) % AC_ROWS;
+    char buf[256];
+    for (uint16_t i = 0; i < acCount; ++i) {
+        const AcRow &r = acRows[(first + i) % AC_ROWS];
+        if (isfinite(r.watts)) snprintf(buf, sizeof(buf), "%lu;%lu;%.1f;%.3f;%.3f;",
+            (unsigned long)r.elapsedS, (unsigned long)r.measuredS, r.watts, r.importWh, r.exportWh);
+        else snprintf(buf, sizeof(buf), "%lu;%lu;;%.3f;%.3f;",
+            (unsigned long)r.elapsedS, (unsigned long)r.measuredS, r.importWh, r.exportWh);
+        const size_t n = strlen(buf);
+        if (isfinite(r.batW)) snprintf(buf+n, sizeof(buf)-n, "%lu;%.2f;%.2f;%.1f;%.6f;%.6f\r\n",
+            (unsigned long)r.batMeasuredS, r.batV, r.batA, r.batW, r.batChargeWh/1000, r.batDischargeWh/1000);
+        else snprintf(buf+n, sizeof(buf)-n, "%lu;;;;%.6f;%.6f\r\n",
+            (unsigned long)r.batMeasuredS, r.batChargeWh/1000, r.batDischargeWh/1000);
+        server.sendContent(buf);
+    }
+    server.sendContent("");
+}
+
 static void handleGetConfig()
 {
     if (!checkAuth()) return;
@@ -767,6 +936,9 @@ static void handlePostConfig()
 static void handleControl()
 {
     if (!checkAuth()) return;
+#ifdef VEBUS_READ_ONLY
+    sendJson("{\"ok\":false,\"error\":\"Read-only diagnosis: controls blocked\"}", 403); return;
+#endif
     String cmd = server.arg("cmd"), val = server.arg("value");
     if (handleCommand(cmd.c_str(), val.c_str(), "web"))
         sendJson("{\"ok\":true}");
@@ -832,6 +1004,8 @@ static void handleUpdateUpload()
         g_otaAuthed = server.authenticate(ADMIN_USER, cfg.adminPass);
         if (!g_otaAuthed) return;
         busQuiet();                             // flash writes stall both cores
+        ledUpdating = true;
+        showStatusLed(LedStatus::Updating, millis());
         Serial.printf("[ota] start: %s\n", up.filename.c_str());
         if (!Update.begin(UPDATE_SIZE_UNKNOWN)) Update.printError(Serial);
     } else if (!g_otaAuthed) {
@@ -840,10 +1014,11 @@ static void handleUpdateUpload()
         if (Update.write(up.buf, up.currentSize) != up.currentSize) Update.printError(Serial);
     } else if (up.status == UPLOAD_FILE_END) {
         if (Update.end(true)) Serial.printf("[ota] done: %u bytes\n", up.totalSize);
-        else                { Update.printError(Serial); busResume(); }
+        else                { Update.printError(Serial); busResume(); ledUpdating = false; }
     } else if (up.status == UPLOAD_FILE_ABORTED) {
         Update.abort();
         busResume();
+        ledUpdating = false;
         Serial.println("[ota] aborted");
     }
 }
@@ -862,6 +1037,14 @@ static void setupWebServer()
         server.send_P(200, "text/css", STYLE_CSS);
     });
     server.on("/api/state",        HTTP_GET,  handleState);
+    server.on("/api/led", HTTP_GET, [] {
+        char json[128];
+        snprintf(json, sizeof(json), "{\"status\":\"%s\",\"gpio\":4,\"brightness\":16}", ledStatusName(ledStatus));
+        sendJson(json);
+    });
+    server.on("/api/ac-log", HTTP_GET, handleAcState);
+    server.on("/admin/api/ac-log", HTTP_POST, handleAcControl);
+    server.on("/admin/ac-log.csv", HTTP_GET, handleAcCsv);
     server.on("/api/history",      HTTP_GET,  handleHistory);
     server.on("/admin",            HTTP_GET,  [] { server.sendHeader("Location", "/admin/"); server.send(302); });
     server.on("/admin/",           HTTP_GET,  [] { if (checkAuth()) sendPage(ADMIN_HTML); });
@@ -978,6 +1161,14 @@ static void pollSerial()
 // =======================================================================
 void setup()
 {
+    // Read frequency scale/offset from the device; retain proven defaults
+    // for all other measurements (battery current, SoC, voltage, power).
+    scaler.queryPeriodsOnly = true;
+    scaler.queryDevice = true;
+
+    statusPixel.begin();
+    statusPixel.setBrightness(16); // about 6%: visible without lighting the room
+    showStatusLed(LedStatus::Startup, millis());
     Serial.begin(115200);
     delay(200);
     Serial.println("\n=== VEBus MQTT → Home Assistant ===");
@@ -997,10 +1188,17 @@ void setup()
     digitalWrite(VEBUS_PIN_SHDN, LOW);
 
     // Start VEBus (configures UART, RS485 task on core 1), then enable the bus
+    pinMode(VEBUS_PIN_POWER, OUTPUT);
+    digitalWrite(VEBUS_PIN_POWER, HIGH);
     vebus.begin(VEBUS_PIN_RX, VEBUS_PIN_TX, VEBUS_PIN_RE);
     digitalWrite(VEBUS_PIN_SHDN, HIGH);
     esp_register_shutdown_handler(busQuiet);   // every orderly restart goes quiet first
     Serial.println("VE.Bus started.");
+    Serial.printf("[ac-log] integration self-check: %s\n", acEnergySelfCheck() ? "PASS" : "FAIL");
+    Serial.printf("[battery-log] 2.4 kWh integration self-check: %s\n", batteryEnergySelfCheck() ? "PASS" : "FAIL");
+    Serial.printf("[status-led] logic self-check: %s\n", statusLedSelfCheck() ? "PASS" : "FAIL");
+    acRows = static_cast<AcRow *>(calloc(AC_ROWS, sizeof(AcRow)));
+    if (!acRows) Serial.println("[battery-log] CSV allocation failed; measurement start blocked");
 
     loadConfig();
 
@@ -1009,10 +1207,15 @@ void setup()
     g_essPower = prefs.getShort("essw", 0);
     bool vmode = prefs.getBool("vmode", false);
     prefs.end();
+#ifdef VEBUS_CONTROL_TEST
+    // Each reboot requires a new deliberate power command for this test build.
+    g_essPower = 0;
+    vmode = false;
+#endif
     g_lastEssCmdMs = millis();                  // fail-safe timeout counts from boot
     vebus.setESSPower(g_essPower);
     if (vmode) vebus.enableVirtualSetpointMode(true);
-    Serial.printf("[cfg] ESS setpoint %d W, battery-neutral %s (restored)\n",
+    Serial.printf("[cfg] ESS startup setpoint %d W, battery-neutral %s\n",
                   g_essPower, vmode ? "ON" : "OFF");
     makeHostName();
     Serial.printf("[cfg] MQTT=%s:%u user='%s' device='%s' prefix='%s'\n",
@@ -1165,10 +1368,10 @@ void loop()
     if (!extRam2Requested && (now - lastESSMs >= EXT_RAM2_OFFSET_MS))
     {
         const uint8_t ids[] = {
-            VEBUS_RAM_IBAT, VEBUS_RAM_CHARGE_STATE,
+            VEBUS_RAM_UBAT, VEBUS_RAM_IBAT, VEBUS_RAM_CHARGE_STATE,
             VEBUS_RAM_MAINS_PERIOD, VEBUS_RAM_INVERTER_PERIOD
         };
-        vebus.readRAMVars(ids, 4);
+        vebus.readRAMVars(ids, 5);
         extRam2Requested = true;
     }
 
@@ -1186,6 +1389,8 @@ void loop()
     // response can never land in the wrong variable; converted to real units.
     if (vebus.hasRAMVarResponse())
     {
+        bool gotBatV = false, gotBatA = false;
+        float sampleV = 0, sampleA = 0;
         for (uint8_t i = 0; i < vebus.getRAMVarCount(); i++)
         {
             uint8_t id  = vebus.getRAMVarId(i);
@@ -1193,8 +1398,19 @@ void loop()
             bool period = id == VEBUS_RAM_MAINS_PERIOD || id == VEBUS_RAM_INVERTER_PERIOD;
             float v = period ? scaler.frequency(id, raw) : scaler.value(id, raw);
             ups.set(id, v);
+            if (id == VEBUS_RAM_UBAT) { gotBatV = true; sampleV = v; }
+            if (id == VEBUS_RAM_IBAT) { gotBatA = true; sampleA = v; }
+            if (id == VEBUS_RAM_MAINS_POWER && !vebus.hasNoSync()) {
+                acHaveMains = true; acMainsMs = millis();
+                if (acRunning) acEnergy.sample(acMainsMs, v * (acInvert ? -1 : 1));
+            }
             if (id == VEBUS_RAM_OUTPUT_POWER)
                 vebus.setACOutLoad((int16_t)lroundf(v));   // virtual setpoint mode
+        }
+        if (gotBatV && gotBatA && !vebus.hasNoSync() && isfinite(sampleV) && sampleV > 0 && isfinite(sampleA)) {
+            batSampleMs = millis(); batHaveSample = true;
+            batSampleV = sampleV; batSampleA = sampleA;
+            if (acRunning) batEnergy.sampleDC(batSampleMs, sampleV, sampleA);
         }
         vebus.clearRAMVarResponse();
     }
@@ -1235,6 +1451,7 @@ void loop()
     }
 
     // Auto-wakeup on no-sync (not while the bus is deliberately muted)
+#if !defined(VEBUS_CONTROL_TEST) && !defined(VEBUS_READ_ONLY)
     if (vebus.hasNoSync() && vebus.isTxEnabled())
     {
         static uint32_t lastWakeupMs = 0;
@@ -1244,6 +1461,14 @@ void loop()
             vebus.requestWakeup();
             Serial.println("[app] No sync — queued wakeup");
         }
+    }
+#endif
+
+    if (acRunning) {
+        const uint32_t acNow = millis();
+        if (!acFresh(acNow)) acEnergy.gap();
+        if (!batFresh(acNow)) batEnergy.gap();
+        if (acNow - acRowMs >= 60000) acRecord(acNow);
     }
 
     STAGE(ST_PUBLISH);
@@ -1266,6 +1491,8 @@ void loop()
 
     STAGE(ST_SERIAL);
     pollSerial();
+    showStatusLed(chooseLedStatus(ledUpdating, WiFi.status() == WL_CONNECTED,
+                                 !vebus.hasNoSync(), WiFi.RSSI(), mqtt.connected(), acRunning), millis());
     STAGE(ST_NONE);
 
     if (g_restartAtMs && (int32_t)(now - g_restartAtMs) >= 0)

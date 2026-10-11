@@ -138,9 +138,14 @@ VE.Bus RJ45 connector:
 
 | T-CAN485 | Multiplus VE.Bus RJ45 |
 |----------|-----------------------|
-| A | Pin 3 (Data+) |
-| B | Pin 4 (Data−) |
-| GND | Pin 5 (GND) |
+| A | Pin 4 (A) |
+| B | Pin 5 (B) |
+| GND | Pin 3 (GND) |
+
+Verified against Victron's Venus GX VE.Bus connector schematic:
+[VE_BBB_Cape_v0.80_released.pdf](https://github.com/victronenergy/venusgx-hardware/blob/master/VE_BBB_Cape_v0.80_released.pdf).
+The previous pin 3=A, pin 4=B, pin 5=GND mapping was incorrect.
+Leave all other RJ45 pins disconnected for this three-wire interface.
 
 > **RS485 requires a ground connection.** Without GND the common-mode voltage
 > drifts and the receiver reads noise.

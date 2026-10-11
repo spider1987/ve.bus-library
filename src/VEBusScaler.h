@@ -52,22 +52,26 @@ public:
         return p > 0 ? 10.0f / p : 0.0f;
     }
 
+    bool queryPeriodsOnly = false; // limit device queries to frequency metadata
     bool queryDevice = false;   // ask the Multiplus for scale/offset (see above)
 
     bool    fromDevice(uint8_t id) const { return id < MAX_ID && _queried[id]; }
-    bool    complete() const             { return _idx >= QUERY_COUNT; }
+    bool    complete() const             { return _idx >= (queryPeriodsOnly ? 2 : QUERY_COUNT); }
     const VEBusVarInfo &info(uint8_t id) const { return _info[id < MAX_ID ? id : 0]; }
 
     void loop()
     {
         if (!queryDevice || complete() || _bus.hasNoSync()) return;
-        uint8_t id = _queryId(_idx);
+        uint8_t id = queryPeriodsOnly ? (_idx == 0 ? VEBUS_RAM_MAINS_PERIOD : VEBUS_RAM_INVERTER_PERIOD) : _queryId(_idx);
 
         if (_bus.hasRAMVarInfoResponse()) {
             if (_bus.getRAMVarInfoId() == id) {
-                _info[id] = VEBusVarInfo::fromDevice(_bus.getRAMVarInfoScale(),
-                                                     _bus.getRAMVarInfoOffset());
-                _queried[id] = true;
+                const VEBusVarInfo candidate = VEBusVarInfo::fromDevice(
+                    _bus.getRAMVarInfoScale(), _bus.getRAMVarInfoOffset());
+                if (candidate.scale > 0 && isfinite(candidate.scale) && candidate.offset != INT16_MIN) {
+                    _info[id] = candidate;
+                    _queried[id] = true;
+                }
                 _next();
             }
             _bus.clearRAMVarInfoResponse();
