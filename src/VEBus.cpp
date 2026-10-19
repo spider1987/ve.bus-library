@@ -72,10 +72,16 @@ void VEBus::setTxEnabled(bool enable)
 // Thread-safe command API
 // -----------------------------------------------------------------------
 
+// Clamp before narrowing: virtual setpoint minus AC-out load can exceed int16.
+static int16_t boundedESSPower(int32_t watts)
+{
+    return (int16_t)(watts < -32767 ? -32767 : watts > 32767 ? 32767 : watts);
+}
+
 void VEBus::setESSPower(int16_t watts)
 {
     _virtualSetpoint = watts;
-    int16_t effective = _virtualMode ? (int16_t)(watts - _lastACOutLoad) : watts;
+    int16_t effective = _virtualMode ? boundedESSPower((int32_t)watts - _lastACOutLoad) : watts;
     _queueESSPower(effective);
 }
 
@@ -84,7 +90,7 @@ void VEBus::enableVirtualSetpointMode(bool enable, int16_t deadbandWatts)
     _virtualMode = enable;
     if (deadbandWatts < 0) deadbandWatts = (int16_t)-deadbandWatts;
     _deadband = deadbandWatts;
-    int16_t effective = enable ? (int16_t)(_virtualSetpoint - _lastACOutLoad)
+    int16_t effective = enable ? boundedESSPower((int32_t)_virtualSetpoint - _lastACOutLoad)
                                : _virtualSetpoint;
     _queueESSPower(effective);
 }
@@ -93,9 +99,9 @@ void VEBus::setACOutLoad(int16_t watts)
 {
     _lastACOutLoad = watts;
     if (!_virtualMode) return;
-    int16_t effective = (int16_t)(_virtualSetpoint - watts);
-    int16_t diff = (int16_t)(effective - _lastSentEffective);
-    if (diff < 0) diff = (int16_t)-diff;
+    int16_t effective = boundedESSPower((int32_t)_virtualSetpoint - watts);
+    int32_t diff = (int32_t)effective - _lastSentEffective;
+    if (diff < 0) diff = -diff;
     if (diff >= _deadband) {
         _queueESSPower(effective);
     }

@@ -36,7 +36,7 @@ inline bool acPowerValue(const char *text, bool charge, int16_t &signedW) {
     for (const char *c = text; *c; ++c) {
         if (*c < '0' || *c > '9') return false;
         watts = watts * 10 + (*c - '0');
-        if (watts > 1875) return false;
+        if (watts > 32767) return false;
     }
     signedW = charge ? -(int16_t)watts : (int16_t)watts;
     return true;
@@ -63,8 +63,10 @@ inline bool acEnergySelfCheck() {
     if (!acPowerValue("300", true, w) || w != -300) return false;
     if (!acPowerValue("300", false, w) || w != 300) return false;
     if (!acPowerValue("0", true, w) || w != 0) return false;
-    if (!acPowerValue("1875", false, w) || w != 1875) return false;
-    const char *invalid[] = {"", "-1", "1.5", "1876", "999999999999", "abc"};
+    if (!acPowerValue("4000", true, w) || w != -4000) return false;
+    if (!acPowerValue("32767", true, w) || w != -32767) return false;
+    if (!acPowerValue("32767", false, w) || w != 32767) return false;
+    const char *invalid[] = {"", "-1", "1.5", "32768", "999999999999", "abc"};
     for (const char *bad : invalid)
         if (acPowerValue(bad, true, w)) return false;
     return true;

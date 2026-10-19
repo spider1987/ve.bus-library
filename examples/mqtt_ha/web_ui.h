@@ -32,6 +32,8 @@ nav{gap:4px;padding:6px;margin-bottom:24px;background:var(--inset);border:1px so
 .diagnostic-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:20px;align-items:start}.diagnostic-group{min-width:0;background:var(--inset);border:1px solid var(--border);border-radius:10px;padding:16px}.diagnostic-group h3{color:var(--accent);margin:0 0 12px;padding-bottom:12px;border-bottom:1px solid var(--border)}.diagnostic-group table{table-layout:fixed}.diagnostic-group th,.diagnostic-group td{padding:10px 0;vertical-align:top;line-height:1.5;height:auto}.diagnostic-group th{width:65%;font-weight:400;text-align:left;color:var(--text2);padding-right:12px;border-bottom:1px solid var(--grid);overflow-wrap:anywhere}.diagnostic-group td{width:35%;text-align:right}.diagnostic-group tr:last-child th,.diagnostic-group tr:last-child td{border-bottom:0}.diagnostic-group .unavailable{color:var(--muted);font-size:11px}.diagnostic-group .note{margin:12px 0 0}
 @media(max-width:800px){.diagnostic-grid{grid-template-columns:1fr;gap:16px}}
 
+@media(max-width:480px){#autoCard .control-readings{grid-template-columns:1fr;gap:12px}#autoCard .reading{display:flex;align-items:center;justify-content:space-between;gap:12px;padding-bottom:12px}#autoCard .reading span{max-width:65%}#autoCard .reading strong{white-space:nowrap}#autoCard .row button{width:100%}}
+.energy-table th{font-size:11px;color:var(--muted);font-weight:600;padding:8px 0;border-bottom:1px solid var(--border);text-align:left}.energy-table td:not(:first-child),.energy-table th:not(:first-child){text-align:right}.energy-table td:first-child{white-space:nowrap}.energy-table th:first-child{width:30%}#energyCard .grid2{row-gap:20px}@media(max-width:480px){.energy-table{font-size:11px}#energyCard .reading strong{font-size:20px}}
 @media(prefers-reduced-motion:reduce){html{scroll-behavior:auto}button:active{transform:none}}
 )rawliteral";
 
@@ -46,6 +48,11 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(<!doctype html>
 <div class="banner" id="pwBanner" style="display:none">Das Admin-Passwort ist noch das Standardpasswort. <a href="/admin/">Jetzt ändern</a>.</div>
 <div class="banner" id="offBanner" style="display:none">Gerät nicht erreichbar — neuer Versuch…</div>
 <div class="banner connection" id="busNotice" role="status"><strong>Verbindung wird geprüft</strong>Messwerte werden geladen.</div><div class="flow"><div><small>AC-IN</small><b>Stromnetz</b></div><span class="flow-arrow">↔</span><div><small>VE.Bus</small><b>MultiPlus</b></div><span class="flow-arrow">↔</span><div><small>DC</small><b>Batterie</b></div></div><section class="tiles" id="tiles"></section>
+<section class="card" id="energyCard"><div class="section-head"><div><div class="eyebrow">Batterieseite · DC</div><h2>Batterieenergie</h2><p class="note" id="energyDate">Tageswerte werden geladen.</p></div></div>
+<div class="grid2"><div class="reading"><span>Heute geladen</span><strong id="energyTodayCharge">—</strong></div><div class="reading"><span>Heute entnommen</span><strong id="energyTodayDischarge">—</strong></div><div class="reading"><span>Gesamt geladen seit Aufzeichnungsbeginn</span><strong id="energyTotalCharge">—</strong></div><div class="reading"><span>Gesamt entnommen seit Aufzeichnungsbeginn</span><strong id="energyTotalDischarge">—</strong></div></div>
+<p class="note" id="energyNote" role="status">Die Zähler laufen unabhängig von Batterietest und Automatik.</p>
+<details class="advanced"><summary>Tagesverlauf · 32 erfasste Tage</summary><table class="energy-table"><thead><tr><th>Datum</th><th>Geladen<br>kWh</th><th>Entnommen<br>kWh</th><th>Erfasst<br>h</th></tr></thead><tbody id="energyDays"></tbody></table></details>
+<details class="advanced"><summary>Dashboard &amp; MQTT</summary><p class="note">HTTP mit Tagesarchiv: <a href="/api/energy" target="_blank" rel="noopener">/api/energy</a><br>MQTT-Zusammenfassung: <code id="energyMqtt">—</code><br>Datierte Tageswerte: <code>…/energy/day/JJJJ-MM-TT</code><br>Zusätzliche Sensoren werden über Home Assistant Discovery bereitgestellt.</p><p class="note">Messbasis: Batteriespannung × Batteriestrom des MultiPlus, ohne kalibrierten Shunt. Tageswechsel: Europe/Berlin mit Sommerzeit. Speicherung alle 10 Minuten, beim Tageswechsel sowie vor Web-Update und angefordertem Neustart. Bei Stromausfall können die letzten 10 Minuten fehlen. Fehlende Messwerte werden nicht hochgerechnet.</p></details></section>
 <section class="card"><div class="row"><h2 style="margin:0">Verlauf</h2><span class="sp" style="flex:1"></span>
 <div class="seg" id="range"><button data-n="60">1 h</button><button data-n="360">6 h</button><button data-n="1440" class="on">24 h</button></div></div>
 <div class="chart"><h3>Leistung (W)</h3><div class="legend" id="lgPower"></div><canvas id="cPower"></canvas><div class="tip"></div></div>
@@ -146,6 +153,16 @@ $('range').onclick=e=>{const n=e.target.dataset.n;if(!n)return;range=+n;for(cons
 addEventListener('resize',drawAll);
 matchMedia('(prefers-color-scheme: dark)').addEventListener('change',drawAll);
 poll();loadHist();setInterval(poll,5000);setInterval(loadHist,60000);
+
+async function energyPoll(){try{const r=await fetch('/api/energy',{cache:'no-store'});if(!r.ok)throw Error();const a=await r.json();
+ const kwh=v=>v===null||v===undefined?'—':Number(v).toLocaleString('de-DE',{minimumFractionDigits:3,maximumFractionDigits:3})+' kWh';
+ for(const [id,key]of [['energyTodayCharge','today_charge_kwh'],['energyTodayDischarge','today_discharge_kwh'],['energyTotalCharge','total_charge_kwh'],['energyTotalDischarge','total_discharge_kwh']])$(id).textContent=kwh(a[key]);
+ $('energyDate').textContent=a.time_valid?'Heute · '+a.date+' · Europe/Berlin':'Uhrzeit wird synchronisiert · Tageswerte noch nicht zugeordnet';
+ $('energyNote').textContent=(a.fresh?'Zähler aktiv':'Keine frischen Batteriewerte · Zähler pausiert')+' · heute '+(a.today_measured_s/3600).toLocaleString('de-DE',{maximumFractionDigits:2})+' h erfasst'+(!a.storage_ok?' · Speichern fehlgeschlagen!':'')+((a.unassigned_charge_kwh+a.unassigned_discharge_kwh)>0?' · Energie ohne gültige Uhrzeit ist nur im Gesamtzähler enthalten.':'');
+ $('energyMqtt').textContent=a.mqtt_topic;
+ $('energyDays').innerHTML=a.days.length?[...a.days].reverse().map(d=>'<tr><td>'+String(d.date).replace(/[^0-9-]/g,'')+'</td><td>'+Number(d.charged_kwh).toLocaleString('de-DE',{minimumFractionDigits:3,maximumFractionDigits:3})+'</td><td>'+Number(d.discharged_kwh).toLocaleString('de-DE',{minimumFractionDigits:3,maximumFractionDigits:3})+'</td><td>'+(d.measured_s/3600).toLocaleString('de-DE',{maximumFractionDigits:2})+'</td></tr>').join(''):'<tr><td colspan="4">Noch keine Tagesaufzeichnung.</td></tr>';
+ }catch(e){$('energyNote').textContent='Energiestatistik nicht erreichbar · erneuter Versuch folgt.';}}
+energyPoll();setInterval(energyPoll,15000);
 </script></body></html>)rawliteral";
 
 static const char ADMIN_HTML[] PROGMEM = R"rawliteral(<!doctype html>
@@ -156,15 +173,37 @@ static const char ADMIN_HTML[] PROGMEM = R"rawliteral(<!doctype html>
 <div class="banner" id="pwBanner" style="display:none">Du verwendest das Standardpasswort <b>vebus</b>. Lege unten ein eigenes Passwort fest.</div>
 
 <div class="banner connection" id="busNotice" role="status"><strong>Verbindung wird geprüft</strong>Messwerte werden geladen.</div>
+<section class="card" id="autoCard"><div class="section-head"><div><div class="eyebrow">Victron zuerst</div><h2>evcc-Automatik</h2><p class="note" id="autoSummary">Lade- und Entladegrenzen werden geladen.</p></div></div>
+<div class="control-readings"><div class="reading"><span>Restbedarf nach PV</span><strong id="autoDemand">—</strong></div><div class="reading"><span>BYD · Entladen + / Laden −</span><strong id="autoByd">—</strong></div><div class="reading"><span>Victron · AC-IN gemessen</span><strong id="autoVic">—</strong></div></div>
+<p class="status-strip" id="autoStatus" role="status">Automatikstatus wird geladen.</p>
+<div class="row"><button class="primary" id="autoOn" onclick="autoAction('on')">Automatik einschalten</button><button id="autoOff" onclick="autoAction('off')">Ausschalten · Sollwert 0 W</button></div>
+<details class="advanced"><summary>Leistungsgrenzen &amp; Batterieschutz</summary><form id="autoSettings"><div class="grid2">
+<label class="f" style="grid-column:1/-1;max-width:240px">Victron-Anteil am Restbedarf (%)<input id="autoSharePct" type="number" min="0" max="100" step="1" value="90" required></label>
+<label class="f">Maximal laden am AC-IN (W)<input id="autoChargeLimit" type="number" min="0" max="32767" step="1" value="3000" required></label>
+<label class="f">Maximal entladen am AC-IN (W)<input id="autoDischargeLimit" type="number" min="0" max="32767" step="1" value="3000" required></label></div>
+<p class="note">Der Victron übernimmt den eingestellten Anteil am Verbrauch nach PV-Abzug, begrenzt durch die maximale Entladeleistung. 0 % deaktiviert die automatische Entladung; PV-Laden bleibt möglich. 0 W deaktiviert die jeweilige Leistungsrichtung.</p>
+<label class="note"><input id="autoCutOn" type="checkbox" onchange="autoCutControls()"> Zusätzliche Entladesperre nach Batteriespannung</label>
+<div class="grid2"><label class="f">Entladen sperren bei (V)<input id="autoCutV" type="number" min="38" max="60" step="0.1" placeholder="Spannungsgrenze deiner Batterie" disabled></label>
+<label class="f">Freigeben nach Spannungsanstieg um (V)<input id="autoDeltaV" type="number" min="0.1" max="5" step="0.1" value="1" disabled></label></div>
+<p class="note" id="autoGuardStatus">Spannungsschutz wird geladen.</p><p class="note">Die Spannungssperre setzt auch manuelle Entlade-Sollwerte am AC-IN auf 0 W. AC-OUT-Verbraucher können weiter Batteriestrom beziehen. Keine vollständige Geräteabschaltung; MultiPlus- und BMS-Schutz bleiben erforderlich.</p>
+<button type="submit" id="autoLimitSave">Grenzen speichern</button></form></details>
+<details class="advanced"><summary>So arbeitet die Regelung</summary><p class="note">Bei Restbedarf übernimmt der Victron den eingestellten Prozentanteil bis zur Entladegrenze. PV-Überschuss lädt die Batterie bis zur eingestellten Ladegrenze. 100 W Totzone, Leistungsänderung maximal 500 W je frischem evcc-Abruf. Bei entladender BYD wird nicht geladen; bei ladender BYD wird nicht entladen (150 W Toleranz). Messwertausfall setzt den AC-IN-Sollwert auf 0 W; das garantiert keinen vollständigen Batteriestopp bei AC-OUT-Verbrauchern. Die Schutzgrenzen im MultiPlus bleiben bestehen.</p>
+<p class="note">Quelle: evcc unter 192.168.178.2:7070. Zuordnung: Batterie 1 = GoodWe/BYD, Batterie 2 = LILYGO/Victron. Nach jedem Neustart automatisch eingeschaltet; Start mit 0 W bis frische evcc- und VE.Bus-Werte vorliegen. Manuelles Ausschalten gilt bis zum nächsten Neustart. Manuelle Leistungsvorgaben und Batterietests sind während der Automatik gesperrt; Schalt- und Ladephasenbefehle beenden die Automatik.</p></details></section>
+
+<section class="card" id="energyCard"><div class="section-head"><div><div class="eyebrow">Batterieseite · DC</div><h2>Batterieenergie</h2><p class="note" id="energyDate">Tageswerte werden geladen.</p></div></div>
+<div class="grid2"><div class="reading"><span>Heute geladen</span><strong id="energyTodayCharge">—</strong></div><div class="reading"><span>Heute entnommen</span><strong id="energyTodayDischarge">—</strong></div><div class="reading"><span>Gesamt geladen seit Aufzeichnungsbeginn</span><strong id="energyTotalCharge">—</strong></div><div class="reading"><span>Gesamt entnommen seit Aufzeichnungsbeginn</span><strong id="energyTotalDischarge">—</strong></div></div>
+<p class="note" id="energyNote" role="status">Die Zähler laufen unabhängig von Batterietest und Automatik.</p>
+<details class="advanced"><summary>Tagesverlauf · 32 erfasste Tage</summary><table class="energy-table"><thead><tr><th>Datum</th><th>Geladen<br>kWh</th><th>Entnommen<br>kWh</th><th>Erfasst<br>h</th></tr></thead><tbody id="energyDays"></tbody></table></details>
+<details class="advanced"><summary>Dashboard &amp; MQTT</summary><p class="note">HTTP mit Tagesarchiv: <a href="/api/energy" target="_blank" rel="noopener">/api/energy</a><br>MQTT-Zusammenfassung: <code id="energyMqtt">—</code><br>Datierte Tageswerte: <code>…/energy/day/JJJJ-MM-TT</code><br>Zusätzliche Sensoren werden über Home Assistant Discovery bereitgestellt.</p><p class="note">Messbasis: Batteriespannung × Batteriestrom des MultiPlus, ohne kalibrierten Shunt. Tageswechsel: Europe/Berlin mit Sommerzeit. Speicherung alle 10 Minuten, beim Tageswechsel sowie vor Web-Update und angefordertem Neustart. Bei Stromausfall können die letzten 10 Minuten fehlen. Fehlende Messwerte werden nicht hochgerechnet.</p></details></section>
 <section class="card"><div class="section-head"><div><h2>Laden &amp; Entladen</h2><p class="note">Leistung am AC-Eingang manuell vorgeben.</p></div></div>
 <div class="control-readings"><div class="reading"><span>Batteriespannung</span><strong id="liveVolt">—</strong></div><div class="reading"><span>Batteriestrom</span><strong id="liveCurrent">—</strong></div><div class="reading"><span>Gerätezustand</span><strong id="liveState">—</strong></div></div>
 <div class="control-grid">
-<label class="f">Leistung am AC-IN (W)<span class="row"><input type="number" id="ess" min="-1875" max="1875" step="1" style="width:120px"><button class="primary" onclick="cmd('ess_power',$('ess').value)">Setzen</button></span></label>
+<label class="f">Leistung am AC-IN (W)<span class="row"><input type="number" id="ess" min="-32767" max="32767" step="1" style="width:120px"><button class="primary" id="essSet" onclick="cmd('ess_power',$('ess').value)">Setzen</button></span></label>
 <label class="f">Betriebsart<span class="row"><select id="sw"><option value="on">Ein</option><option value="off">Aus</option><option value="charger_only">Nur Ladegerät</option><option value="inverter_only">Nur Wechselrichter</option></select><button onclick="cmd('switch_state',$('sw').value)">Übernehmen</button></span></label>
-<label class="f">Batterieneutraler USV-Modus<span class="row"><select id="vm"><option value="OFF">Aus</option><option value="ON">Ein</option></select><button onclick="cmd('virtual_mode',$('vm').value)">Übernehmen</button></span></label>
+<label class="f">Batterieneutraler USV-Modus<span class="row"><select id="vm"><option value="OFF">Aus</option><option value="ON">Ein</option></select><button id="vmSet" onclick="cmd('virtual_mode',$('vm').value)">Übernehmen</button></span></label>
 </div>
 <p class="status-strip" id="ctlState"></p>
-<div class="hint"><h3>Was bedeutet das Vorzeichen?</h3><p class="note"><b>Minus → Netzbezug / Laden</b> · <b>Plus → Einspeisen / Entladen</b><br>Bereich: −1875 bis +1875 W. Der Sollwert regelt AC-IN. Verbraucher an AC-OUT beeinflussen den tatsächlichen Batteriestrom. 0 W ist kein garantierter Batteriestopp.</p></div>
+<div class="hint"><h3>Was bedeutet das Vorzeichen?</h3><p class="note"><b>Minus → Netzbezug / Laden</b> · <b>Plus → Einspeisen / Entladen</b><br><strong>MultiPlus-II 48/5000/70-50</strong><br>Wechselrichter: 4.000 W Dauerleistung bei 25 °C (5.000 VA). Ladegerät: maximal 70 A DC; die Ladeleistung hängt von der Batteriespannung und den eingestellten Limits ab.<br> Der Sollwert regelt AC-IN. Verbraucher an AC-OUT beeinflussen den tatsächlichen Batteriestrom. 0 W ist kein garantierter Batteriestopp.</p></div>
 
 <div class="row"><button onclick="cmd('wakeup')">Einschalten</button><button onclick="cmd('sleep')">Ausschalten</button>
 </div><details class="advanced"><summary>Erweiterte Ladefunktionen</summary><p class="note">Nur verwenden, wenn die Ladeart zur Batterie passt. Ausgleichsladung ist kein normaler Batterietest.</p><div class="row"><button onclick="cmd('force_absorption')">Absorptionsladung starten</button><button onclick="cmd('force_float')">Erhaltungsladung starten</button>
@@ -184,7 +223,7 @@ static const char ADMIN_HTML[] PROGMEM = R"rawliteral(<!doctype html>
 <div class="grid2" style="margin-bottom:20px"><div class="reading"><span>Gemessener Netzbezug · AC-IN</span><strong id="acChargeW">—</strong></div><div class="reading"><span>Gemessene Einspeisung · AC-IN</span><strong id="acDischargeW">—</strong></div></div>
 <details class="advanced"><summary>Lade-/Entladeleistung einstellen · optional</summary>
 <label class="note"><input type="checkbox" id="acEnablePower" onchange="acPowerControls()"> Leistungsvorgabe für den laufenden Test aktivieren</label>
-<div class="grid2"><label class="f">Gewünschte Richtung<select id="acDirection" disabled><option value="charge">Laden / Netzbezug</option><option value="discharge">Entladen / Einspeisen</option></select></label><label class="f">Leistungsvorgabe am AC-IN (W)<input type="number" id="acWatts" min="0" max="1875" step="1" value="100" disabled></label></div>
+<div class="grid2"><label class="f">Gewünschte Richtung<select id="acDirection" disabled><option value="charge">Laden / Netzbezug</option><option value="discharge">Entladen / Einspeisen</option></select></label><label class="f">Leistungsvorgabe am AC-IN (W)<input type="number" id="acWatts" min="0" max="32767" step="1" value="100" disabled></label></div>
 <div class="row" style="margin-top:16px"><button class="primary" id="acApplyPower" onclick="acSetPower(false)" disabled>Leistung übernehmen</button><button id="acZeroPower" onclick="acSetPower(true)" disabled>AC-IN-Sollwert auf 0 W</button></div>
 <p class="status-strip" id="acPowerSetpoint">Sollwert wird geladen.</p>
 <p class="note">Nur bei laufender Messung und frischen Messwerten verfügbar. Die Vorgabe ändert den ESS-Sollwert; die Betriebsart und der batterieneutrale Modus bleiben bestehen. Im batterieneutralen Modus wird der AC-OUT-Verbrauch zusätzlich berücksichtigt. Die gemessenen Werte oben zeigen AC-IN, nicht die direkte Batterieleistung.</p>
@@ -246,7 +285,7 @@ async function post(url,body){const r=await fetch(url,{method:'POST',body:new UR
 function syncSoc(){const text=$('syncSoc').value.trim(),n=Number(text);if(!/^\d{1,3}$/.test(text)||!Number.isInteger(n)||n<0||n>100){toast('Bitte eine ganze Zahl von 0 bis 100 eingeben.');return;}if(confirm('Ist der tatsächliche Ladestand bekannt? Internen Victron-Ladestand auf '+n+' % setzen? Dies kann die ESS-Regelung beeinflussen.'))cmd('sync_soc',String(n));}
 async function cmd(c,v){try{await post('/admin/api/control',{cmd:c,value:v??''});toast('Befehl gesendet: '+de(c)+' (Wirkung am Gerät prüfen)');setTimeout(state,1500)}catch(e){toast('Fehler: '+e.message)}}
 async function state(){try{const s=await (await fetch('/api/state',{cache:'no-store'})).json();$('readOnlyNotice').style.display=s.read_only?'block':'none';if(s.read_only){document.querySelectorAll('button[onclick]').forEach(b=>{if((b.getAttribute('onclick')||'').startsWith('cmd('))b.disabled=true});['ess','sw','vm','acEnablePower','acApplyPower','acZeroPower'].forEach(id=>{if($(id))$(id).disabled=true})}
-  const connected=connection(s);$('readOnlyNotice').style.display=s.read_only?'block':'none';$('liveVolt').textContent=connected?s.bat_volt.toFixed(2)+' V':'—';$('liveCurrent').textContent=connected?s.bat_current.toFixed(1)+' A':'—';$('liveState').textContent=connected?de(s.device_state):'Nicht verbunden';$('sub').textContent=`${s.device_id} · ${s.ip}`;$('pwBanner').style.display=s.default_pw?'block':'none';
+  const connected=connection(s);autoReadOnly=!!s.read_only;$('readOnlyNotice').style.display=s.read_only?'block':'none';$('liveVolt').textContent=connected?s.bat_volt.toFixed(2)+' V':'—';$('liveCurrent').textContent=connected?s.bat_current.toFixed(1)+' A':'—';$('liveState').textContent=connected?de(s.device_state):'Nicht verbunden';$('sub').textContent=`${s.device_id} · ${s.ip}`;$('pwBanner').style.display=s.default_pw?'block':'none';
   $('ctlState').textContent=`Aktuell: Sollwert ${s.ess_power} W (wirksam ${s.ess_power_eff} W) · Betriebsart ${de(s.switch_state)} · batterieneutral ${de(s.virtual_mode)} · Zustand ${de(s.device_state)}`;
   if(document.activeElement!==$('ess')&&$('ess').value==='')$('ess').value=s.ess_power;
   if(document.activeElement!==$('sw'))$('sw').value=s.switch_state;if(document.activeElement!==$('vm'))$('vm').value=s.virtual_mode;
@@ -262,26 +301,45 @@ $('cfg').onsubmit=async e=>{e.preventDefault();const f=new FormData(e.target);
   if($('ap1').value!==$('ap2').value){toast('Passwörter stimmen nicht überein');return}
   if($('ap1').value)f.append('admin_pass',$('ap1').value);
   try{await post('/admin/api/config',f);toast('Gespeichert — MQTT verbindet sich neu');$('ap1').value=$('ap2').value='';f.get('clear_pass')&&(e.target.clear_pass.checked=false);loadCfg();state()}catch(err){toast('Fehler: '+err.message)}};
+let autoActive=false,autoReadOnly=false,autoConfigLoaded=false;
+async function autoPoll(){try{const r=await fetch('/api/auto',{cache:'no-store'});if(!r.ok)throw Error();const a=await r.json();autoActive=a.enabled;
+ const w=v=>Number(v).toLocaleString('de-DE')+' W';
+ $('autoSummary').textContent='Max. laden '+w(a.charge_limit_w)+' · max. entladen '+w(a.discharge_limit_w)+' · '+a.share_pct+' % Restbedarf';
+ if(!autoConfigLoaded){$('autoSharePct').value=a.share_pct;$('autoChargeLimit').value=a.charge_limit_w;$('autoDischargeLimit').value=a.discharge_limit_w;$('autoCutOn').checked=a.cutoff_v>0;$('autoCutV').value=a.cutoff_v||'';$('autoDeltaV').value=a.resume_delta_v;autoConfigLoaded=true;autoCutControls();}
+ $('autoGuardStatus').textContent=a.cutoff_v>0?(a.discharge_blocked?'Entladesperre aktiv / Batteriespannung prüfen. ':'Entladen freigegeben. ')+'Sperre bei '+Number(a.cutoff_v).toLocaleString('de-DE')+' V · Freigabe ab '+Number(a.cutoff_v+a.resume_delta_v).toLocaleString('de-DE')+' V':'Zusätzliche Spannungssperre ausgeschaltet. Grenze passend zur Batteriekonfiguration eintragen.';
+ $('autoLimitSave').disabled=autoReadOnly;
+
+ $('autoStatus').textContent=a.status+' · Ziel '+w(a.target_w)+' · AC-IN-Sollwert '+w(a.setpoint_w);
+ for(const [id,key] of [['autoDemand','demand_w'],['autoByd','byd_w'],['autoVic','victron_w']])$(id).textContent=a.fresh?w(a[key]):'—';
+ $('autoOn').disabled=autoReadOnly||a.enabled;$('autoOff').disabled=autoReadOnly||!a.enabled;
+ for(const id of ['ess','essSet','vm','vmSet'])$(id).disabled=autoReadOnly||a.enabled;
+ if(a.enabled)$('acStart').disabled=true;
+ }catch(e){$('autoStatus').textContent='Automatikstatus nicht erreichbar';$('autoOn').disabled=true;}}
+async function autoAction(action){$('autoOn').disabled=$('autoOff').disabled=true;try{await post('/admin/api/auto',{action});toast(action==='on'?'Automatik eingeschaltet':'Automatik aus · Sollwert 0 W');}catch(e){toast('Fehler: '+e.message)}await autoPoll();await state();}
+function autoCutControls(){const on=$('autoCutOn').checked;$('autoCutV').disabled=$('autoDeltaV').disabled=!on||autoReadOnly;$('autoCutV').required=on;}
+$('autoSettings').onsubmit=async e=>{e.preventDefault();const share=Number($('autoSharePct').value),charge=Number($('autoChargeLimit').value),discharge=Number($('autoDischargeLimit').value),cut=$('autoCutOn').checked?Number($('autoCutV').value):0,delta=Number($('autoDeltaV').value);
+ if(!Number.isInteger(share)||share<0||share>100||!Number.isInteger(charge)||charge<0||charge>32767||!Number.isInteger(discharge)||discharge<0||discharge>32767||!Number.isFinite(cut)||(cut!==0&&(cut<38||cut>60))||!Number.isFinite(delta)||delta<.1||delta>5){toast('Leistungs- und Spannungsgrenzen prüfen.');return;}
+ $('autoLimitSave').disabled=true;try{await post('/admin/api/auto/config',{share_pct:share,charge_limit_w:charge,discharge_limit_w:discharge,cutoff_v:cut,resume_delta_v:delta});autoConfigLoaded=false;toast('Leistungsgrenzen und Spannungsschutz gespeichert.');}catch(err){toast('Fehler: '+err.message)}await autoPoll();};
 let acCanSetPower=false;
 function acPowerControls(){const enabled=acCanSetPower&&$('acEnablePower').checked;for(const id of ['acDirection','acWatts','acApplyPower','acZeroPower'])$(id).disabled=!enabled;}
-async function acSetPower(zero){const watts=zero?0:Number($('acWatts').value);if((!zero&&$('acWatts').value.trim()==='')||!Number.isInteger(watts)||watts<0||watts>1875){toast('Bitte eine ganze Zahl von 0 bis 1875 W eingeben.');return;}
+async function acSetPower(zero){const watts=zero?0:Number($('acWatts').value);if((!zero&&$('acWatts').value.trim()==='')||!Number.isInteger(watts)||watts<0||watts>32767){toast('Bitte eine ganze Zahl von 0 bis 32767 W eingeben.');return;}
  $('acApplyPower').disabled=$('acZeroPower').disabled=true;
  try{await post('/admin/api/ac-log',{action:'power',direction:$('acDirection').value,watts});toast('ESS-Sollwert gesendet — tatsächliche Leistung prüfen.');setTimeout(state,1500);}catch(e){toast('Fehler: '+e.message)}await acPoll();}
 async function acPoll(){try{const r=await fetch('/api/ac-log',{cache:'no-store'});if(!r.ok)throw new Error('HTTP '+r.status);const a=await r.json();
  const wh=v=>Number(v).toLocaleString('de-DE',{minimumFractionDigits:1,maximumFractionDigits:1})+' Wh';
- acCanSetPower=a.running&&a.fresh&&!a.read_only;acPowerControls();$('acPowerSetpoint').textContent='Vorgabe: '+a.setpoint_w+' W · wirksam: '+a.effective_w+' W · batterieneutral: '+(a.virtual_mode?'Ein':'Aus');$('acChargeW').textContent=a.power_w===null?'—':Math.max(0,a.power_w).toLocaleString('de-DE')+' W';$('acDischargeW').textContent=a.power_w===null?'—':Math.max(0,-a.power_w).toLocaleString('de-DE')+' W';$('acImport').textContent=wh(a.import_wh);$('acExport').textContent=wh(a.export_wh);$('acPower').textContent=a.power_w===null?'—':Number(a.power_w).toLocaleString('de-DE')+' W';
+ acCanSetPower=a.running&&a.fresh&&!a.read_only&&!autoActive;acPowerControls();$('acPowerSetpoint').textContent='Vorgabe: '+a.setpoint_w+' W · wirksam: '+a.effective_w+' W · batterieneutral: '+(a.virtual_mode?'Ein':'Aus');$('acChargeW').textContent=a.power_w===null?'—':Math.max(0,a.power_w).toLocaleString('de-DE')+' W';$('acDischargeW').textContent=a.power_w===null?'—':Math.max(0,-a.power_w).toLocaleString('de-DE')+' W';$('acImport').textContent=wh(a.import_wh);$('acExport').textContent=wh(a.export_wh);$('acPower').textContent=a.power_w===null?'—':Number(a.power_w).toLocaleString('de-DE')+' W';
  const kwh=v=>Number(v).toLocaleString('de-DE',{minimumFractionDigits:3,maximumFractionDigits:3})+' kWh';
  $('batChargeKwh').textContent=kwh(a.battery_charge_kwh);$('batDischargeKwh').textContent=kwh(a.battery_discharge_kwh);$('batPower').textContent=a.battery_power_w===null?'—':Math.abs(a.battery_power_w).toLocaleString('de-DE')+' W · '+(a.battery_power_w>0?'Laden':a.battery_power_w<0?'Entladen':'Ruhe');
  const mins=s=>(s/60).toLocaleString('de-DE',{maximumFractionDigits:1})+' min';
  $('acStatus').textContent=(a.running?(a.fresh?'Messung läuft':'Messung läuft · wartet auf frische AC-IN-Werte'):a.started?'Messung beendet':'Noch kein Messlauf')+' · Laufzeit '+mins(a.elapsed_s)+' · erfasst '+mins(a.measured_s)+' · '+a.rows+' CSV-Einträge'+(a.rows_total>a.rows?' (ältere Einträge überschrieben)':'');
  $('batResult').textContent=(a.started?(a.running?'Bisher entnommen: ':'Testergebnis · entnommene Batterieenergie: ')+kwh(a.battery_discharge_kwh)+' · geladen: '+kwh(a.battery_charge_kwh)+' · Batterie-Messzeit '+mins(a.battery_measured_s):'Noch kein Batterietest.')+(a.running&&!a.battery_fresh?' · Batteriewerte fehlen, Zähler pausiert.':'')+(a.started&&a.elapsed_s-a.battery_measured_s>15?' · Messlücken: Ergebnis unvollständig.':'')+(a.started&&!a.running?' · Als nutzbare Kapazität nur bei vollständiger Entladung ab voller Batterie bewerten.':'');
- $('acStart').disabled=a.running||!a.fresh||!a.battery_fresh;$('acStop').disabled=!a.running;$('acCsv').disabled=!a.rows;$('acInvert').disabled=a.running;
+ $('acStart').disabled=autoActive||a.running||!a.fresh||!a.battery_fresh;$('acStop').disabled=!a.running;$('acCsv').disabled=!a.rows;$('acInvert').disabled=a.running;
  if(a.running)$('acInvert').checked=a.inverted;
  }catch(e){acCanSetPower=false;acPowerControls();$('acChargeW').textContent=$('acDischargeW').textContent='—';$('acStatus').textContent='Messstatus nicht erreichbar · neuer Versuch folgt.';$('acStart').disabled=$('acStop').disabled=true;$('acPower').textContent=$('batPower').textContent='—';}}
 async function acAction(action){if(action==='start'&&!confirm('Neuen Batterietest mit AC-IN-Messung starten? Die bisherige Aufzeichnung wird ersetzt. Der WR-Betrieb bleibt unverändert.'))return;
  $('acStart').disabled=$('acStop').disabled=true;
  try{await post('/admin/api/ac-log',{action,invert:$('acInvert').checked?'1':'0'});toast(action==='start'?'Aufzeichnung gestartet':'Aufzeichnung beendet — WR-Betrieb unverändert');}catch(e){toast('Fehler: '+e.message)}await acPoll();}
-acPoll();setInterval(acPoll,5000);
+acPoll();setInterval(acPoll,5000);autoPoll();setInterval(autoPoll,5000);
 
 function upload(){const file=$('fw').files[0];if(!file){toast('Zuerst eine .bin-Datei auswählen');return}
   const x=new XMLHttpRequest(),fd=new FormData(),p=$('prog');fd.append('firmware',file);
@@ -290,4 +348,14 @@ function upload(){const file=$('fw').files[0];if(!file){toast('Zuerst eine .bin-
   x.onerror=()=>{toast('Hochladen fehlgeschlagen');$('fwBtn').disabled=false};
   $('fwBtn').disabled=true;x.open('POST','/admin/update');x.send(fd)}
 loadCfg().catch(()=>toast('Einstellungen konnten nicht geladen werden. Seite erneut laden.'));state();setInterval(state,5000);
+
+async function energyPoll(){try{const r=await fetch('/api/energy',{cache:'no-store'});if(!r.ok)throw Error();const a=await r.json();
+ const kwh=v=>v===null||v===undefined?'—':Number(v).toLocaleString('de-DE',{minimumFractionDigits:3,maximumFractionDigits:3})+' kWh';
+ for(const [id,key]of [['energyTodayCharge','today_charge_kwh'],['energyTodayDischarge','today_discharge_kwh'],['energyTotalCharge','total_charge_kwh'],['energyTotalDischarge','total_discharge_kwh']])$(id).textContent=kwh(a[key]);
+ $('energyDate').textContent=a.time_valid?'Heute · '+a.date+' · Europe/Berlin':'Uhrzeit wird synchronisiert · Tageswerte noch nicht zugeordnet';
+ $('energyNote').textContent=(a.fresh?'Zähler aktiv':'Keine frischen Batteriewerte · Zähler pausiert')+' · heute '+(a.today_measured_s/3600).toLocaleString('de-DE',{maximumFractionDigits:2})+' h erfasst'+(!a.storage_ok?' · Speichern fehlgeschlagen!':'')+((a.unassigned_charge_kwh+a.unassigned_discharge_kwh)>0?' · Energie ohne gültige Uhrzeit ist nur im Gesamtzähler enthalten.':'');
+ $('energyMqtt').textContent=a.mqtt_topic;
+ $('energyDays').innerHTML=a.days.length?[...a.days].reverse().map(d=>'<tr><td>'+String(d.date).replace(/[^0-9-]/g,'')+'</td><td>'+Number(d.charged_kwh).toLocaleString('de-DE',{minimumFractionDigits:3,maximumFractionDigits:3})+'</td><td>'+Number(d.discharged_kwh).toLocaleString('de-DE',{minimumFractionDigits:3,maximumFractionDigits:3})+'</td><td>'+(d.measured_s/3600).toLocaleString('de-DE',{maximumFractionDigits:2})+'</td></tr>').join(''):'<tr><td colspan="4">Noch keine Tagesaufzeichnung.</td></tr>';
+ }catch(e){$('energyNote').textContent='Energiestatistik nicht erreichbar · erneuter Versuch folgt.';}}
+energyPoll();setInterval(energyPoll,15000);
 </script></body></html>)rawliteral";

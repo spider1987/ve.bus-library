@@ -263,7 +263,7 @@ Full example with automatic no-sync recovery and interactive serial commands:
 
 | Serial input | Action |
 |-------------|--------|
-| `<number>` | Set ESS power (-1875..1875 W) |
+| `<number>` | Set ESS power (-32767..32767 W) |
 | `w` | Wakeup (switch ON) |
 | `s` | Sleep (switch OFF) |
 | `co` | Charger-only mode |
@@ -443,7 +443,7 @@ state topic automatically through discovery (entity ids are unchanged).
 
 | Entity | Type | Details |
 |--------|------|---------|
-| ESS Power Setpoint | Number | -1875..1875 W |
+| ESS Power Setpoint | Number | -32767..32767 W |
 | Switch State | Select | on / off / charger_only / inverter_only |
 | Battery-Neutral UPS Mode | Switch | toggles virtual setpoint mode |
 | Wakeup Multiplus | Button | — |
@@ -857,3 +857,103 @@ read everything from it. `nut.user`/`nut.pass` enable login checks,
 MIT — see [LICENSE](LICENSE).
 
 Original firmware by PepeTheFroggie, MIT licensed.
+
+
+### LILYGO evcc priority control (automatic startup)
+
+The admin UI includes evcc automatic control for this installation: HTTP state at
+`http://192.168.178.2:7070/api/state`, exactly two `battery.devices` in order
+GoodWe/BYD then LilyGo/Victron. Changing device order requires updating the mapping.
+It polls on a separate task, leaving VE.Bus and WebServer scheduling unblocked.
+`grid.power + sum(battery.devices[].power)` gives demand after PV including EVs.
+Discharge targets the configured percentage of positive demand (default 90%); negative demand charges from surplus.
+Both AC-IN targets are capped at 3000 W; 100 W deadband and 500 W steps per snapshot.
+If the other battery works in the opposite direction (more than 150 W), target is zero.
+This reduces cross-charging; transient flows depend on GoodWe response timing.
+
+Start/stop uses authenticated `POST /admin/api/auto`, form `action=on|off`.
+Read-only status: `GET /api/auto`. Each boot starts with 0 W and automatically
+enables control after the evcc worker is created. No saved power or virtual mode
+is restored. The existing input-freshness and voltage gates apply before output. Missing/invalid evcc data, non-two-device
+configuration, loss of WiFi or stale VE.Bus measurements fall back to 0 W.
+HTTP freshness is not a guarantee of fresh upstream GoodWe meter data inside evcc.
+No new SOC estimate or battery voltage limit is introduced; existing MultiPlus
+protection remains responsible. Zero AC-IN target does not guarantee zero DC current.
+Manual ESS/virtual mode and battery tests are blocked until auto is disabled.
+Switch/forced charge-phase actions terminate automatic control first.
+
+
+### Adjustable auto limits, voltage guard and energy statistics
+
+`POST /admin/api/auto/config` (authenticated form): `charge_limit_w`,
+`discharge_limit_w` (whole AC-IN watts, default 3000 each, 0 disables direction),
+`cutoff_v` (0 disables the guard; otherwise 38..60 V), `resume_delta_v` (0.1..5 V).
+All fields are validated before modifying or persisting settings. Reduced limits
+apply immediately. The voltage latch blocks automatic and manual positive ESS
+commands and returns existing discharge setpoints to zero. It releases at
+cutoff + hysteresis. With guard enabled a restart begins blocked until that
+recovery voltage is observed. Missing fresh battery values also blocks discharge.
+This is an AC-IN discharge stop, not a physical battery disconnect or guaranteed
+zero battery current with AC-OUT consumers. Hardware/BMS protection stays active.
+
+The continuous DC energy recorder runs independently from tests and auto mode.
+`GET /api/energy` returns today's, yesterday's and lifetime charged/discharged
+kWh, measurement coverage, unassigned energy, and `days` (last 32 recorded dates).
+Daily records use Europe/Berlin (including DST); linear energy integration splits
+at local midnight. No extrapolation across missing measurements. Energy collected
+without valid wall time is counted in totals and separately as unassigned.
+Lifetime totals start with installation of this feature; old test data is not imported.
+NVS stores a versioned snapshot every 10 minutes, at a day rollover, before an
+authenticated OTA and before requested web reboot. Unexpected power loss may lose
+up to 10 minutes. NVS itself and actual midnight operation still need device tests.
+
+MQTT `<prefix>/energy` publishes a retained summary every minute while connected.
+`<prefix>/state` also carries `energy_today_charge_kwh`,
+`energy_today_discharge_kwh`, `energy_yesterday_charge_kwh`,
+`energy_yesterday_discharge_kwh`, `energy_total_charge_kwh`,
+`energy_total_discharge_kwh`, `energy_time_valid`,
+`energy_unassigned_charge_kwh`, `energy_unassigned_discharge_kwh`,
+and `discharge_blocked`. Daily fields are null until the clock is valid.
+Home Assistant Discovery includes the six daily/yesterday/total energy sensors.
+32-day history is available via HTTP. MQTT `<prefix>/energy/day/YYYY-MM-DD`
+publishes retained dated records (today and yesterday refreshed each minute);
+the broker can retain these beyond the on-device 32-day window. Configure broker
+persistence for an external long-term archive. Older retained days are not deleted.
+MQTT dashboards can also archive the summary with its date. Total values are monotonic except an unsaved power-loss tail.
+
+Compile-time integration/archive checks (no device required):
+`xtensa-esp32-elf-g++ -std=c++14 -c tests/energy_model_compile.cpp -o energy-test.o`
+The normal firmware stays compatible with its existing C++11 build.
+
+Auto configuration and state also appear read-only in the regular MQTT state:
+`auto_enabled`, `auto_charge_limit_w`, `auto_discharge_limit_w`, `auto_cutoff_v`,
+`auto_resume_delta_v`. The voltage guard defaults to disabled rather than guessing
+a cutoff for mixed modules. Configure it in the UI before relying on it.
+HA daily energy sensors use `total` with explicit `energy_day_start`; lifetime
+sensors use `total` without reset detection, so rollback of an unsaved power-loss
+tail is not mistaken for a full meter reset. Yesterday sensors are display-only.
+
+
+### Adjustable Victron percentage
+
+The auto settings UI now includes `share_pct` (whole percent 0..100, default 90),
+persisted in NVS. It scales positive demand after PV deduction, before the watt
+limit is applied. Zero disables automatic discharge but does not disable PV
+surplus charging. Existing voltage, opposite-battery and measurement-freshness
+guards remain active. Percentage decreases reduce the active discharge target
+immediately; increases follow the normal ramp. The authenticated auto config
+endpoint accepts `share_pct` optionally for compatibility with existing callers.
+`GET /api/auto` returns the active `share_pct`; regular HTTP/MQTT state exposes
+`auto_share_pct`. It is a requested share, not a guaranteed split during hardware
+limits or GoodWe response transients.
+
+
+### Automatic startup after reboot
+
+Normal control firmware enables the evcc automatic controller after boot, starting
+at 0 W and waiting for fresh, valid evcc and VE.Bus measurements. Limits, percent
+share and voltage guard settings remain persisted. The normal ramp applies after
+valid input arrives; absent input keeps the setpoint at zero. Manual disabling
+lasts until the next reboot. The read-only build never auto-enables control. If
+the HTTP worker cannot be created, auto mode stays off. Saved manual/automatic
+power and virtual mode are never replayed on startup.
