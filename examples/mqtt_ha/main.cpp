@@ -6,7 +6,7 @@
  *   battery-neutral switch, buttons, diagnostics).
  * - Built-in web UI on http://<device-ip>/ (or http://<hostname>.local/):
  *     /        live dashboard + 24 h history charts (public, read-only)
- *     /admin/  controls, settings, firmware update (HTTP basic auth,
+ *     /admin/  controls, settings, firmware update (web login/session cookie,
  *              user "admin", default password "vebus" — change it!)
  * - Self-healing: task watchdog on the main loop, WiFi supervisor, MQTT
  *   reconnect with short timeouts, optional ESS setpoint fail-safe.
@@ -30,6 +30,7 @@
 #include <PubSubClient.h>
 #include <esp_task_wdt.h>
 #include <esp_system.h>
+#include <esp_ota_ops.h>
 #include <stdarg.h>
 #include <VEBus.h>
 #include "web_ui.h"
@@ -38,7 +39,9 @@
 #include "StatusLed.h"
 #include "AutoPower.h"
 #include "EnergyBook.h"
+#include "WiFiRecovery.h"
 #include <sys/time.h>
+#include <mbedtls/sha256.h>
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
 #include <Adafruit_NeoPixel.h>
@@ -103,8 +106,7 @@ static void showStatusLed(LedStatus state, uint32_t now) {
 
 // Robustness
 #define WDT_TIMEOUT_S          30        // main loop must check in this often
-#define WIFI_KICK_MS        30000UL      // retry WiFi association every 30 s
-#define WIFI_REBOOT_MS     600000UL      // reboot after 10 min without WiFi
+// WiFi recovery timings and checks are defined in WiFiRecovery.h.
 
 // History (for the dashboard charts): one averaged sample per minute, 24 h
 #define HIST_INTERVAL_MS    60000UL
@@ -139,6 +141,7 @@ VEBus        vebus;
 WiFiManager  wm;
 Preferences  prefs;
 WebServer    server(80);
+static bool wifiPortalOwnsHttp = false;
 VEBusScaler        scaler(vebus); // RAM scale/offset, queried from the Multiplus
 VEBusUps           ups(vebus);   // UPS view: status, runtime, statistics
 VEBusNutServer     nut(ups);     // NUT, TCP 3493
@@ -201,7 +204,7 @@ bool     g_otaAuthed      = false;
 bool     g_essDirty       = false;   // ESS setpoint / virtual mode not yet in NVS
 uint32_t g_essSavedMs     = 0;
 
-struct AutoSettings { uint16_t chargeW=3000, dischargeW=3000; uint8_t sharePct=90; float cutoffV=0, resumeDeltaV=1; } autoCfg;
+struct AutoSettings { uint16_t chargeW=3000, dischargeW=3000; uint8_t sharePct=90; uint16_t bydThresholdW=100, dataTimeoutS=35; float cutoffV=0, resumeDeltaV=1; } autoCfg;
 static bool voltageBlocked = false;
 static bool dischargeBlocked() { return autoCfg.cutoffV>0 && (voltageBlocked || !batFresh(millis())); }
 static void updateVoltageGuard() {
@@ -280,7 +283,7 @@ static const EnergyDay *yesterdayEnergy() {
 }
 
 // evcc snapshots are read on a separate task: HTTP never blocks VE.Bus/UI.
-struct AutoSnapshot { bool valid; uint32_t atMs; int gridW, otherW, victronW, demandW; };
+struct AutoSnapshot { bool valid, solarValid; uint32_t atMs; int gridW, otherW, victronW, demandW, solarResidualW; };
 static QueueHandle_t autoQueue = nullptr;
 static bool autoEnabled = false, autoHaveSample = false;
 static AutoSnapshot autoSample = {};
@@ -299,10 +302,12 @@ static void autoWorker(void *) {
             http.setTimeout(2000);
             if (http.begin(client, AUTO_URL)) {
                 if (http.GET() == 200 && http.getSize() <= 65536) {
-                    StaticJsonDocument<256> filter;
+                    StaticJsonDocument<512> filter;
                     filter["grid"]["power"] = true;
+                    filter["homePower"] = true; filter["pvPower"] = true;
+                    filter["loadpoints"][0]["chargePower"] = true;
                     filter["battery"]["devices"][0]["power"] = true;
-                    DynamicJsonDocument doc(2048);
+                    DynamicJsonDocument doc(4096);
                     const DeserializationError err = deserializeJson(doc, http.getStream(), DeserializationOption::Filter(filter));
                     JsonArray devices = doc["battery"]["devices"].as<JsonArray>();
                     // Verified installation: device 1 = GoodWe/BYD, device 2 = LilyGo.
@@ -315,6 +320,17 @@ static void autoWorker(void *) {
                             // Grid + all batteries = consumption minus PV (includes EV loads).
                             snap.demandW = snap.gridW + snap.otherW + snap.victronW;
                             snap.valid = true;
+                            // Explicit solar gate: include EV consumption, never substitute missing values.
+                            if(doc["homePower"].is<float>() && doc["pvPower"].is<float>() && doc["loadpoints"].is<JsonArray>()) {
+                                float home=doc["homePower"], pv=doc["pvPower"], ev=0;
+                                bool ok=isfinite(home) && isfinite(pv) && home>=0 && pv>=0 && home<100000 && pv<100000;
+                                for(JsonObject lp: doc["loadpoints"].as<JsonArray>()) {
+                                    if(!lp["chargePower"].is<float>()){ok=false;break;}
+                                    float w=lp["chargePower"]; if(!isfinite(w) || w<0 || w>=100000){ok=false;break;} ev+=w;
+                                }
+                                snap.solarValid=ok && ev<100000;
+                                if(snap.solarValid)snap.solarResidualW=lroundf(home+ev-pv);
+                            }
                         }
                     }
                 }
@@ -340,23 +356,39 @@ static void autoStop() {
 static void autoLoop(uint32_t now) {
     AutoSnapshot next;
     bool updated = autoQueue && xQueueReceive(autoQueue, &next, 0) == pdTRUE;
-    if (updated) { autoSample = next; autoHaveSample = true; }
+    const bool complete=updated && next.valid && next.solarValid;
+    // An incomplete HTTP response must not overwrite the last usable timestamp.
+    if(complete){autoSample=next;autoHaveSample=true;}
+    if(autoEnabled && updated && next.valid && g_essPower<0 && next.otherW>autoCfg.bydThresholdW) {
+        autoWanted=0;autoSetPower(0);autoReason="Pausiert · BYD entlädt";
+    }
     if (!autoEnabled) return;
     const int limited=AutoPower::bounded(g_essPower,autoCfg.chargeW,autoCfg.dischargeW);
     if(limited!=g_essPower)autoSetPower(limited);
     if(dischargeBlocked() && autoWanted>0){autoWanted=0;autoReason="Entladesperre · Batteriespannung";}
-    if (!AutoPower::inputsFresh(autoHaveSample && autoSample.valid, now - autoSample.atMs,
-        WiFi.status() == WL_CONNECTED, acFresh(now), batFresh(now), vebus.isTxEnabled())) {
-        autoReason = "Pausiert · Messwerte fehlen oder veraltet"; autoWanted = 0;
-        if (g_essPower) autoSetPower(0);
+    if(!acFresh(now) || !batFresh(now) || !vebus.isTxEnabled()) {
+        autoReason="Pausiert · VE.Bus-Messwerte fehlen";autoWanted=0;
+        if(g_essPower)autoSetPower(0);
         return;
     }
-    if (!updated) { g_lastEssCmdMs = now; return; }
-    autoWanted = AutoPower::target(autoSample.demandW, autoSample.otherW,autoCfg.chargeW,autoCfg.dischargeW,autoCfg.sharePct);
+    if(!AutoPower::holdEvcc(autoHaveSample,now-autoSample.atMs,autoCfg.dataTimeoutS)) {
+        autoReason="Pausiert · evcc-Datenzeit abgelaufen";autoWanted=0;
+        if(g_essPower)autoSetPower(0);
+        return;
+    }
+    if(!complete) {
+        g_lastEssCmdMs=now;
+        if(now-autoSample.atMs>7500)autoReason="Warte auf evcc · letzten Sollwert halten";
+        return;
+    }
+    autoWanted = AutoPower::target(autoSample.demandW, autoSample.otherW,autoCfg.chargeW,autoCfg.dischargeW,autoCfg.sharePct,autoCfg.bydThresholdW);
+    autoWanted=AutoPower::solarGate(autoWanted,autoSample.solarValid,autoSample.solarResidualW,autoSample.otherW,autoCfg.chargeW,autoCfg.bydThresholdW);
     const bool voltageStop=autoWanted>0 && dischargeBlocked();
     if(voltageStop)autoWanted=0;
     autoReason = autoSample.demandW>100 && (!autoCfg.dischargeW || !autoCfg.sharePct) ? "Entladen deaktiviert" : autoSample.demandW< -100 && !autoCfg.chargeW ? "Laden deaktiviert" : voltageStop ? "Entladesperre · Batteriespannung" : autoWanted > 0 ? "Entladen · eingestellter Victron-Anteil" : autoWanted < 0 ? "Laden · PV-Überschuss" :
-        autoSample.demandW < -100 && autoSample.otherW > 150 ? "Pausiert · BYD entlädt" :
+        autoSample.demandW < -100 && !autoSample.solarValid ? "Pausiert · PV-/Verbrauchsmesswerte fehlen" :
+        autoSample.demandW < -100 && autoSample.solarResidualW >= -100 ? "Bereit · kein gesicherter PV-Überschuss" :
+        autoSample.demandW < -100 && autoSample.otherW > autoCfg.bydThresholdW ? "Pausiert · BYD entlädt" :
         autoSample.demandW > 100 && autoSample.otherW < -150 ? "Pausiert · BYD lädt" : "Bereit · Totzone";
     autoSetPower(AutoPower::approach(g_essPower, autoWanted));
 }
@@ -502,6 +534,10 @@ static void loadConfig()
     cfg.nominalW    =      prefs.getUShort("nomw",    0);
     cfg.apcEnabled  =      prefs.getBool("apc",       true);
     cfg.batteryWh   =      prefs.getUShort("batwh",   0);
+    autoCfg.bydThresholdW=prefs.getUShort("autobyd",100);
+    autoCfg.dataTimeoutS=prefs.getUShort("autowait",35);
+    if(autoCfg.bydThresholdW>1000)autoCfg.bydThresholdW=100;
+    if(autoCfg.dataTimeoutS<5 || autoCfg.dataTimeoutS>120)autoCfg.dataTimeoutS=35;
     autoCfg.sharePct=prefs.getUChar("autoshare",90);
     if(autoCfg.sharePct>100)autoCfg.sharePct=90;
     autoCfg.chargeW=prefs.getUShort("autocw",3000);
@@ -537,6 +573,7 @@ static void saveConfig()
     prefs.putUShort("nomw",    cfg.nominalW);
     prefs.putBool("apc",       cfg.apcEnabled);
     prefs.putUShort("batwh",   cfg.batteryWh);
+    prefs.putUShort("autobyd",autoCfg.bydThresholdW);prefs.putUShort("autowait",autoCfg.dataTimeoutS);
     prefs.putUChar("autoshare",autoCfg.sharePct);
     prefs.putUShort("autocw",autoCfg.chargeW);prefs.putUShort("autodw",autoCfg.dischargeW);
     prefs.putFloat("autocut",autoCfg.cutoffV);prefs.putFloat("autodelta",autoCfg.resumeDeltaV);
@@ -564,24 +601,32 @@ static void applyMqttConfig()
 }
 
 // =======================================================================
-// Captive portal (first setup only)
+// Captive portal: WiFi only; application credentials stay behind web login.
 // =======================================================================
-WiFiManagerParameter *wmpHost, *wmpPort, *wmpUser, *wmpPass,
-                     *wmpDeviceId, *wmpTopicPref, *wmpAdmin;
-
-static void onPortalSave()
-{
-    strlcpy(cfg.mqttHost, wmpHost->getValue(),      sizeof(cfg.mqttHost));
-    cfg.mqttPort = (uint16_t)atoi(wmpPort->getValue());
-    if (cfg.mqttPort == 0) cfg.mqttPort = DEFAULT_MQTT_PORT;
-    strlcpy(cfg.mqttUser, wmpUser->getValue(),      sizeof(cfg.mqttUser));
-    strlcpy(cfg.mqttPass, wmpPass->getValue(),      sizeof(cfg.mqttPass));
-    strlcpy(cfg.deviceId, wmpDeviceId->getValue(),  sizeof(cfg.deviceId));
-    strlcpy(cfg.prefix,   wmpTopicPref->getValue(), sizeof(cfg.prefix));
-    if (wmpAdmin->getValue()[0])
-        strlcpy(cfg.adminPass, wmpAdmin->getValue(), sizeof(cfg.adminPass));
-    saveConfig();
-    Serial.println("[wm] config saved");
+static void setupWiFiPortal() {
+    wm.setConfigPortalBlocking(false);
+    wm.setConfigPortalTimeout(0); // remain available until a WiFi connection succeeds
+    wm.setConnectTimeout(15);
+    wm.setSaveConnectTimeout(5);
+    wm.setConnectRetries(1);
+    wm.setCaptivePortalEnable(true);
+    wm.setHostname(hostName);
+    wm.setTitle("VE.Bus WLAN-Einrichtung");
+    wm.setClass("invert");
+    static const char *menu[]={"wifi"};
+    wm.setMenu(menu,1);
+    // WiFiManager calls this before adding its own handlers. The first
+    // matching route wins, keeping the unauthenticated fallback WiFi-only.
+    wm.setWebServerCallback([] {
+        wm.server->on("/",HTTP_GET,[] {
+            wm.server->sendHeader("Cache-Control","no-store");
+            wm.server->sendHeader("Location",String("http://")+WiFi.softAPIP().toString()+"/wifi");
+            wm.server->send(302,"text/plain","");
+        });
+        for(const char *path:{"/update","/u","/erase","/restart","/param","/paramsave","/exit","/close"}) {
+            wm.server->on(path,HTTP_ANY,[] {wm.server->send(403,"text/plain","Nur WLAN-Einrichtung. Weitere Einstellungen in der angemeldeten Web-UI.");});
+        }
+    });
 }
 
 // =======================================================================
@@ -679,8 +724,9 @@ static void buildStateJson(Buf &j)
 #else
     j.add("{\"read_only\":false,");
 #endif
-    j.add("\"bat_volt\":%.2f,\"ac_power\":%d,\"dc_current\":%.1f,\"temp\":%.1f,",
-          vebus.getBatVolt(), (int)vebus.getACPower(), vebus.getDCCurrent(), vebus.getTemp());
+    j.add("\"bat_volt\":%.2f,\"ac_power\":%d,\"dc_current\":%.1f,",
+          vebus.getBatVolt(), (int)vebus.getACPower(), vebus.getDCCurrent());
+    j.add("\"temp\":null,\"temp_available\":false,");
     j.add("\"charger_status\":%u,\"ess_power\":%d,\"ess_power_eff\":%d,\"virtual_mode\":\"%s\",",
           (unsigned)vebus.getChargerStatus(), (int)g_essPower,
           (int)vebus.getEffectiveESSPower(), vebus.isVirtualSetpointMode() ? "ON" : "OFF");
@@ -688,6 +734,7 @@ static void buildStateJson(Buf &j)
           "\"output_power\":%.0f,\"mains_power\":%.0f,",
           live.mainsV, live.mainsA, live.invV, live.invA, live.outW, live.mainsW);
     j.add("\"bat_current\":%.1f,\"soc\":%.1f,", live.batA, live.soc);
+    j.add("\"battery_fresh\":%s,", batFresh(millis()) ? "true" : "false");
     if (live.mainsHz > 0) j.add("\"mains_freq\":%.2f,", live.mainsHz); else j.add("\"mains_freq\":null,");
     if (live.invHz > 0)   j.add("\"inv_freq\":%.2f,", live.invHz);     else j.add("\"inv_freq\":null,");
     j.add("\"led_on\":%u,\"led_blink\":%u,\"ac_in_min\":%.1f,\"ac_in_max\":%.1f,"
@@ -712,6 +759,7 @@ static void buildStateJson(Buf &j)
     const bool timeValid=localDate(time(nullptr))!=0;
     const EnergyDay *today=todayEnergy(),*yesterday=yesterdayEnergy();
     char dayStart[32];dayStartText(dayStart,sizeof(dayStart));j.add("\"energy_day_start\":");if(timeValid)j.str(dayStart);else j.add("null");j.add(",");
+    j.add("\"auto_byd_threshold_w\":%u,\"auto_data_timeout_s\":%u,",autoCfg.bydThresholdW,autoCfg.dataTimeoutS);
     j.add("\"auto_share_pct\":%u,",autoCfg.sharePct);
     j.add("\"auto_enabled\":%s,\"auto_charge_limit_w\":%u,\"auto_discharge_limit_w\":%u,\"auto_cutoff_v\":%.2f,\"auto_resume_delta_v\":%.2f,",autoEnabled?"true":"false",autoCfg.chargeW,autoCfg.dischargeW,autoCfg.cutoffV,autoCfg.resumeDeltaV);
     j.add("\"energy_total_charge_kwh\":%.6f,\"energy_total_discharge_kwh\":%.6f,",energyBook.chargeWh/1000,energyBook.dischargeWh/1000);
@@ -763,7 +811,7 @@ static const Entity ENTITIES[] = {
     {"sensor", "vebus_bat_volt",   false, "Battery Voltage",     "bat_volt",       nullptr, "\"unit_of_meas\":\"V\",\"dev_cla\":\"voltage\"" MEAS},
     {"sensor", "vebus_ac_power",   false, "AC Power",            "ac_power",       nullptr, "\"unit_of_meas\":\"W\",\"dev_cla\":\"power\"" MEAS},
     {"sensor", "vebus_dc_current", false, "DC Current",          "dc_current",     nullptr, "\"unit_of_meas\":\"A\",\"dev_cla\":\"current\"" MEAS},
-    {"sensor", "vebus_temp",       false, "Temperature",         "temp",           nullptr, "\"unit_of_meas\":\"°C\",\"dev_cla\":\"temperature\"" MEAS},
+    {"sensor", "vebus_temp",       false, "WR-Temperatur",       "temp",           nullptr, "\"unit_of_meas\":\"°C\",\"dev_cla\":\"temperature\"" MEAS},
     {"sensor", "vebus_charger",    false, "Charger Status",      "charger_status", nullptr, ""},
     {"sensor", "vebus_ess_state",  false, "ESS Power",           "ess_power",      nullptr, "\"unit_of_meas\":\"W\",\"dev_cla\":\"power\"" MEAS},
     {"sensor", "vebus_ess_eff",    false, "Effective ESS Power", "ess_power_eff",  nullptr, "\"unit_of_meas\":\"W\",\"dev_cla\":\"power\"" MEAS},
@@ -925,11 +973,85 @@ static void histPush()
 // =======================================================================
 // Web server
 // =======================================================================
-static bool checkAuth()
-{
-    if (server.authenticate(ADMIN_USER, cfg.adminPass)) return true;
-    server.requestAuthentication(BASIC_AUTH, "VEBus admin");
+// Opaque random session tokens: only SHA-256 digests are persisted, never the cookie.
+static String authHashes[4];
+static uint64_t authExpiry[4]={};
+static uint8_t authNext=0;
+static uint32_t authRetryAt=0;
+static String authHash(const String &value) {
+    unsigned char digest[32];char hex[65];
+    mbedtls_sha256_ret((const unsigned char*)value.c_str(),value.length(),digest,0);
+    for(unsigned i=0;i<32;i++)snprintf(hex+2*i,3,"%02x",digest[i]);
+    return String(hex);
+}
+static void authStore() {
+    Preferences ap;if(!ap.begin("web_auth",false))return;
+    ap.putString("password",authHash(cfg.adminPass));ap.putUChar("next",authNext);
+    for(unsigned i=0;i<4;i++){char key[8];snprintf(key,sizeof(key),"s%u",i);ap.putString(key,authHashes[i]);snprintf(key,sizeof(key),"e%u",i);ap.putULong64(key,authExpiry[i]);}
+    ap.end();
+}
+static void authInit() {
+    Preferences ap;if(!ap.begin("web_auth",true))return;
+    if(ap.getString("password")==authHash(cfg.adminPass)) {
+        authNext=ap.getUChar("next",0)%4;
+        for(unsigned i=0;i<4;i++){char key[8];snprintf(key,sizeof(key),"s%u",i);authHashes[i]=ap.getString(key);snprintf(key,sizeof(key),"e%u",i);authExpiry[i]=ap.getULong64(key,0);}
+    }
+    ap.end();
+}
+static void authClear() { for(unsigned i=0;i<4;i++){authHashes[i]="";authExpiry[i]=0;}authStore(); }
+static String authCookie() {
+    String cookies=server.header("Cookie");int start=0;
+    while(start<(int)cookies.length()) {
+        int end=cookies.indexOf(';',start);if(end<0)end=cookies.length();
+        String part=cookies.substring(start,end);part.trim();
+        if(part.startsWith("vebus_session="))return part.substring(14);
+        start=end+1;
+    }
+    return "";
+}
+static int authSlot() {
+    const String token=authCookie();if(token.length()!=64)return -1;
+    const String hash=authHash(token);
+    for(unsigned i=0;i<4;i++)if(authHashes[i].length()==64 && authHashes[i]==hash) {
+        const time_t now=time(nullptr);
+        if(now>1700000000) {
+            if(authExpiry[i] && (uint64_t)now>=authExpiry[i])return -1;
+            if(!authExpiry[i]){authExpiry[i]=(uint64_t)now+2592000;authStore();}
+        }
+        return i;
+    }
+    return -1;
+}
+static bool authOrigin() {
+    const String origin=server.header("Origin");
+    return !origin.length() || origin=="http://"+server.hostHeader() || origin=="https://"+server.hostHeader();
+}
+static bool checkAuth() {
+    if(authSlot()>=0 && (server.method()==HTTP_GET || authOrigin()))return true;
+    server.sendHeader("Cache-Control","no-store");
+    if(server.uri()=="/admin/") {server.sendHeader("Location","/login");server.send(303);}
+    else server.send(401,"application/json","{\"ok\":false,\"error\":\"Bitte erneut anmelden\"}");
     return false;
+}
+static void handleLogin() {
+    server.sendHeader("Cache-Control","no-store");
+    if(!authOrigin()){server.send(403,"application/json","{\"error\":\"Unzulässige Herkunft\"}");return;}
+    if(authRetryAt && (int32_t)(millis()-authRetryAt)<0){server.send(429,"application/json","{\"error\":\"Bitte kurz warten\"}");return;}
+    if(server.arg("username")!=ADMIN_USER || server.arg("password")!=cfg.adminPass) {
+        authRetryAt=millis()+1500;server.send(401,"application/json","{\"error\":\"Benutzername oder Passwort falsch\"}");return;
+    }
+    authRetryAt=0;unsigned char random[32];char token[65];esp_fill_random(random,sizeof(random));
+    for(unsigned i=0;i<32;i++)snprintf(token+2*i,3,"%02x",random[i]);
+    authHashes[authNext]=authHash(token);authExpiry[authNext]=time(nullptr)>1700000000?(uint64_t)time(nullptr)+2592000:0;authNext=(authNext+1)%4;authStore();
+    String cookie=String("vebus_session=")+token+"; Path=/; HttpOnly; SameSite=Strict";
+    if(server.arg("remember")=="1")cookie+="; Max-Age=2592000";
+    server.sendHeader("Set-Cookie",cookie);server.send(200,"application/json","{\"ok\":true}");
+}
+static void handleLogout() {
+    if(!checkAuth())return;
+    const int slot=authSlot();if(slot>=0){authHashes[slot]="";authExpiry[slot]=0;authStore();}
+    server.sendHeader("Set-Cookie","vebus_session=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0");
+    server.send(200,"application/json","{\"ok\":true}");
 }
 
 static void sendJson(const char *json, int code = 200)
@@ -953,6 +1075,36 @@ static void handleState()
     j.str(cfg.deviceId);
     j.add("}");
     sendJson(payloadBuf);
+}
+
+// Public read-only system information; no credentials or control endpoints.
+static void handleSystem() {
+    const uint32_t heapFree=ESP.getFreeHeap();
+    DynamicJsonDocument doc(4096);
+    doc["hostname"]=hostName;doc["uptime_s"]=millis()/1000;
+    doc["reset_reason"]=resetReasonName();doc["reset_code"]=(int)esp_reset_reason();doc["crash_stage"]=STAGE_NAMES[g_crashStage];
+    if(!vebus.hasNoSync() && g_fwVersion[0])doc["vebus_firmware"]=g_fwVersion;else doc["vebus_firmware"]=nullptr;
+    JsonObject hw=doc.createNestedObject("hardware");
+    hw["chip_model"]=ESP.getChipModel();hw["revision"]=ESP.getChipRevision();hw["cores"]=ESP.getChipCores();hw["cpu_mhz"]=ESP.getCpuFreqMHz();
+    JsonObject mem=doc.createNestedObject("memory");
+    mem["heap_free"]=heapFree;mem["heap_total"]=ESP.getHeapSize();mem["heap_min_free"]=ESP.getMinFreeHeap();mem["heap_max_block"]=ESP.getMaxAllocHeap();
+    mem["flash_total"]=ESP.getFlashChipSize();mem["sketch_used"]=ESP.getSketchSize();mem["psram_total"]=ESP.getPsramSize();mem["psram_free"]=ESP.getFreePsram();
+    const esp_partition_t *partition=esp_ota_get_running_partition();
+    if(partition)mem["sketch_capacity"]=partition->size;else mem["sketch_capacity"]=nullptr;
+    JsonObject fw=doc.createNestedObject("firmware");
+    fw["application"]="VE.Bus MQTT / LILYGO";fw["build"]=__DATE__ " " __TIME__;fw["sdk"]=ESP.getSdkVersion();
+    if(partition)fw["partition"]=partition->label;else fw["partition"]=nullptr;
+#ifdef VEBUS_READ_ONLY
+    fw["read_only"]=true;
+#else
+    fw["read_only"]=false;
+#endif
+    JsonObject network=doc.createNestedObject("network");
+    const bool connected=WiFi.status()==WL_CONNECTED;network["connected"]=connected;
+    if(connected){network["ip"]=WiFi.localIP().toString();network["gateway"]=WiFi.gatewayIP().toString();network["subnet"]=WiFi.subnetMask().toString();network["rssi"]=WiFi.RSSI();}
+    JsonObject con=doc.createNestedObject("connections");
+    con["mqtt"]=mqtt.connected();con["vebus"]=!vebus.hasNoSync();con["wifi_reconnects"]=g_wifiReconnects;con["mqtt_reconnects"]=g_mqttReconnects;
+    String out;serializeJson(doc,out);sendJson(out.c_str());
 }
 
 // Streams ~40 kB without building it in RAM.
@@ -1128,7 +1280,7 @@ static void handlePostConfig()
     if (server.hasArg("admin_pass")) {
         String p = server.arg("admin_pass");
         if (p.length() >= 4 && p.length() < sizeof(cfg.adminPass))
-            strlcpy(cfg.adminPass, p.c_str(), sizeof(cfg.adminPass));
+        { if(p!=cfg.adminPass){strlcpy(cfg.adminPass, p.c_str(), sizeof(cfg.adminPass));authClear();} }
         else if (p.length()) {
             sendJson("{\"ok\":false,\"error\":\"Admin password must be 4-31 characters\"}", 400);
             return;
@@ -1145,7 +1297,10 @@ static void handlePostConfig()
 static void handleAutoState() {
     StaticJsonDocument<1024> doc;
     doc["enabled"]=autoEnabled;doc["fresh"]=autoHaveSample&&autoSample.valid&&millis()-autoSample.atMs<=15000;
+    doc["byd_threshold_w"]=autoCfg.bydThresholdW;doc["data_timeout_s"]=autoCfg.dataTimeoutS;
+    doc["data_age_s"]=autoHaveSample?(millis()-autoSample.atMs)/1000:0;
     doc["status"]=autoReason;doc["share_pct"]=autoCfg.sharePct;doc["target_w"]=autoWanted;doc["setpoint_w"]=g_essPower;
+    doc["solar_valid"]=autoSample.solarValid;doc["solar_residual_w"]=autoSample.solarResidualW;
     doc["grid_w"]=autoSample.gridW;doc["byd_w"]=autoSample.otherW;doc["victron_w"]=autoSample.victronW;doc["demand_w"]=autoSample.demandW;
     doc["charge_limit_w"]=autoCfg.chargeW;doc["discharge_limit_w"]=autoCfg.dischargeW;
     doc["cutoff_v"]=autoCfg.cutoffV;doc["resume_delta_v"]=autoCfg.resumeDeltaV;doc["discharge_blocked"]=dischargeBlocked();
@@ -1161,20 +1316,23 @@ static void handleAutoConfig() {
 #ifdef VEBUS_READ_ONLY
     sendJson("{\"ok\":false,\"error\":\"Nur-Lesen-Firmware\"}",403);return;
 #endif
-    double charge,discharge,cutoff,delta,share=autoCfg.sharePct;
-    if(!autoNumber("charge_limit_w",charge)||!autoNumber("discharge_limit_w",discharge)||
+    double charge,discharge,cutoff,delta,share=autoCfg.sharePct,byd=autoCfg.bydThresholdW,wait=autoCfg.dataTimeoutS;
+    if((server.hasArg("byd_threshold_w")&&!autoNumber("byd_threshold_w",byd))||byd<0||byd>1000||floor(byd)!=byd||
+       (server.hasArg("data_timeout_s")&&!autoNumber("data_timeout_s",wait))||wait<5||wait>120||floor(wait)!=wait||
+       !autoNumber("charge_limit_w",charge)||!autoNumber("discharge_limit_w",discharge)||
        !autoNumber("cutoff_v",cutoff)||!autoNumber("resume_delta_v",delta)||
        (server.hasArg("share_pct")&&!autoNumber("share_pct",share))||share<0||share>100||floor(share)!=share||
        charge<0||charge>32767||floor(charge)!=charge||discharge<0||discharge>32767||floor(discharge)!=discharge||
        (cutoff!=0&&(cutoff<38||cutoff>60))||delta<.1||delta>5) {
         sendJson("{\"ok\":false,\"error\":\"Victron-Anteil: 0–100 % ganzzahlig; Leistung: ganze Watt ab 0; Spannung: 0 oder 38–60 V; Hysterese: 0,1–5 V\"}",400);return;
     }
+    autoCfg.bydThresholdW=byd;autoCfg.dataTimeoutS=wait;
     autoCfg.sharePct=share;autoCfg.chargeW=charge;autoCfg.dischargeW=discharge;autoCfg.cutoffV=cutoff;autoCfg.resumeDeltaV=delta;
     updateVoltageGuard();saveConfig();
     if(autoEnabled) {
         // Reductions take effect immediately; increases retain the existing ramp.
         if(g_essPower>0 && autoHaveSample && autoSample.valid && millis()-autoSample.atMs<=15000) {
-            autoWanted=AutoPower::target(autoSample.demandW,autoSample.otherW,autoCfg.chargeW,autoCfg.dischargeW,autoCfg.sharePct);
+            autoWanted=AutoPower::target(autoSample.demandW,autoSample.otherW,autoCfg.chargeW,autoCfg.dischargeW,autoCfg.sharePct,autoCfg.bydThresholdW);
             autoSetPower(min((int)g_essPower,max(0,autoWanted)));
         } else autoSetPower(g_essPower);
     }
@@ -1318,7 +1476,7 @@ static void handleUpdateUpload()
     esp_task_wdt_reset();                       // large uploads take a while
     STAGE(ST_OTA);
     if (up.status == UPLOAD_FILE_START) {
-        g_otaAuthed = server.authenticate(ADMIN_USER, cfg.adminPass);
+        g_otaAuthed = authSlot()>=0 && authOrigin();
         if (!g_otaAuthed) return;
         saveEnergy(true);
         busQuiet();                             // flash writes stall both cores
@@ -1349,11 +1507,24 @@ static void sendPage(const char *html)
 
 static void setupWebServer()
 {
+    authInit();
+    const char *headers[]={"Cookie","Origin"};server.collectHeaders(headers,2);
+    server.on("/login",HTTP_GET,[]{if(authSlot()>=0){server.sendHeader("Location","/admin/");server.send(303);}else sendPage(LOGIN_HTML);});
+    server.on("/auth/login",HTTP_POST,handleLogin);
+    server.on("/auth/logout",HTTP_POST,handleLogout);
     server.on("/",                 HTTP_GET,  [] { sendPage(INDEX_HTML); });
+    server.on("/theme.js", HTTP_GET, [] {
+        server.sendHeader("Cache-Control", "max-age=3600");
+        server.send_P(200,"application/javascript; charset=utf-8",THEME_JS);
+    });
     server.on("/style.css",        HTTP_GET,  [] {
         server.sendHeader("Cache-Control", "max-age=3600");
         server.send_P(200, "text/css", STYLE_CSS);
     });
+    server.on("/info",HTTP_GET,[]{server.sendHeader("Location","/info/system");server.send(302);});
+    server.on("/info/",HTTP_GET,[]{server.sendHeader("Location","/info/system");server.send(302);});
+    server.on("/info/system",HTTP_GET,[]{sendPage(INFO_HTML);});
+    server.on("/api/system",HTTP_GET,handleSystem);
     server.on("/api/state",        HTTP_GET,  handleState);
     server.on("/api/led", HTTP_GET, [] {
         char json[128];
@@ -1378,7 +1549,7 @@ static void setupWebServer()
     server.on("/admin/api/wifireset", HTTP_POST, handleWifiReset);
     server.on("/admin/update",     HTTP_POST, handleUpdateDone, handleUpdateUpload);
     server.onNotFound([] { server.send(404, "text/plain", "Not found"); });
-    server.begin();
+    if(!wm.getConfigPortalActive())server.begin();
 }
 
 // =======================================================================
@@ -1416,43 +1587,41 @@ static void setupTaskWatchdog()
     esp_task_wdt_add(NULL);   // loopTask: reboot if loop() stalls
 }
 
-// ESP32 auto-reconnect occasionally gives up (AP reboot, DHCP hiccup).
-// Kick it periodically and reboot as a last resort.
-static void superviseWiFi(uint32_t now)
-{
-    static bool     down = false;
-    static uint32_t downSince = 0, lastKick = 0;
-
-    if (WiFi.status() == WL_CONNECTED) {
-        if (down) {
-            Serial.printf("[wifi] reconnected (%s)\n", WiFi.localIP().toString().c_str());
+// Recover the saved network and offer a nonblocking captive portal on loss.
+// The dashboard and WiFiManager take turns owning TCP port 80.
+static void superviseWiFi(uint32_t now) {
+    static bool down=false;
+    static uint32_t downSince=0,lastKick=0,lastPortalAttempt=0;
+    if(wm.getConfigPortalActive())wm.process();
+    if(WiFi.status()==WL_CONNECTED) {
+        if(wm.getConfigPortalActive())wm.stopConfigPortal();
+        if(down || wifiPortalOwnsHttp) {
+            Serial.printf("[wifi] connected (%s), restoring dashboard\n",WiFi.localIP().toString().c_str());
             g_wifiReconnects++;
-            // Listening sockets do not reliably survive a reconnect on the
-            // ESP32 core — restart every server so they stay reachable.
-            server.stop();
-            server.begin();
-            nut.end();                          // re-begun from loop()
-            apc.end();
-            MDNS.end();
-            if (MDNS.begin(hostName)) MDNS.addService("http", "tcp", 80);
+            wifiPortalOwnsHttp=false;
+            WiFi.setSleep(false);
+            server.stop();server.begin();
+            nut.end();apc.end();
+            MDNS.end();if(MDNS.begin(hostName))MDNS.addService("http","tcp",80);
         }
-        down = false;
+        down=false;
         return;
     }
-    if (!down) {
-        down = true;
-        downSince = lastKick = now;
-        Serial.println("[wifi] connection lost");
+    if(!down){down=true;downSince=lastKick=now;Serial.println("[wifi] connection lost");}
+    if(wifiPortalOwnsHttp && !wm.getConfigPortalActive()) {
+        wifiPortalOwnsHttp=false;server.begin();
     }
-    if (now - lastKick >= WIFI_KICK_MS) {
-        lastKick = now;
-        Serial.println("[wifi] reconnecting...");
-        WiFi.disconnect();
-        WiFi.begin();
+    if(WiFiRecovery::openPortal(false,wm.getConfigPortalActive(),now-downSince,now-lastPortalAttempt)) {
+        lastPortalAttempt=now;
+        server.stop();nut.end();apc.end();MDNS.end();
+        wm.startConfigPortal(AP_SSID,AP_PASS);
+        wifiPortalOwnsHttp=wm.getConfigPortalActive();
+        if(!wifiPortalOwnsHttp)server.begin();
+        Serial.printf("[wifi] setup AP %s: %s\n",AP_SSID,wifiPortalOwnsHttp?"active":"start failed, will retry");
     }
-    if (now - downSince >= WIFI_REBOOT_MS) {
-        Serial.println("[wifi] offline too long — rebooting");
-        ESP.restart();
+    if(WiFiRecovery::retry(false,wm.getConfigPortalActive(),WiFi.softAPgetStationNum(),now-lastKick)) {
+        lastKick=now;
+        WiFi.begin(); // enable STA alongside AP; do not interrupt an attached setup client
     }
 }
 
@@ -1540,41 +1709,16 @@ void setup()
     Serial.printf("[cfg] MQTT=%s:%u user='%s' device='%s' prefix='%s'\n",
                   cfg.mqttHost, cfg.mqttPort, cfg.mqttUser, cfg.deviceId, cfg.prefix);
 
-    // Captive portal parameters (only shown when the portal opens)
-    char portBuf[8];
-    snprintf(portBuf, sizeof(portBuf), "%u", cfg.mqttPort);
-    wmpHost      = new WiFiManagerParameter("host",   "MQTT host",         cfg.mqttHost, 63);
-    wmpPort      = new WiFiManagerParameter("port",   "MQTT port",         portBuf,       5);
-    wmpUser      = new WiFiManagerParameter("user",   "MQTT username",     cfg.mqttUser, 31);
-    wmpPass      = new WiFiManagerParameter("pass",   "MQTT password",     cfg.mqttPass, 63);
-    wmpDeviceId  = new WiFiManagerParameter("device", "HA device id",      cfg.deviceId, 31);
-    wmpTopicPref = new WiFiManagerParameter("prefix", "MQTT topic prefix", cfg.prefix,   63);
-    wmpAdmin     = new WiFiManagerParameter("admin",  "Web admin password (user: admin, default: vebus)", "", 31);
-    wm.addParameter(wmpHost);
-    wm.addParameter(wmpPort);
-    wm.addParameter(wmpUser);
-    wm.addParameter(wmpPass);
-    wm.addParameter(wmpDeviceId);
-    wm.addParameter(wmpTopicPref);
-    wm.addParameter(wmpAdmin);
-    wm.setSaveParamsCallback(onPortalSave);
-    wm.setConfigPortalBlocking(true);
-    wm.setConnectTimeout(30);
-    wm.setConfigPortalTimeout(300);   // no one configured it → reboot and retry
-    wm.setHostname(hostName);
-
-    // First boot or no reachable WiFi → captive portal AP. Otherwise STA connect.
-    if (!wm.autoConnect(AP_SSID, AP_PASS)) {
-        Serial.println("[wm] autoConnect failed/timed out — rebooting");
-        delay(1000);
-        ESP.restart();
-    }
-    makeHostName();                   // device id may have changed in the portal
+    setupWiFiPortal();
+    // Attempt saved WiFi for at most 15 seconds. The fallback AP returns
+    // immediately; process it from loop(), without offline reboot loops.
+    wm.autoConnect(AP_SSID,AP_PASS);
+    wifiPortalOwnsHttp=wm.getConfigPortalActive();
     WiFi.setSleep(false);             // modem sleep makes the web UI sluggish/unreachable
     WiFi.setAutoReconnect(true);
-    Serial.printf("[wifi] connected (%s)\n", WiFi.localIP().toString().c_str());
+    Serial.printf("[wifi] mode: %s\n",wifiPortalOwnsHttp?"setup AP":"station");
 
-    if (MDNS.begin(hostName)) MDNS.addService("http", "tcp", 80);
+    if (WiFi.status()==WL_CONNECTED && MDNS.begin(hostName)) MDNS.addService("http", "tcp", 80);
     setenv("TZ","CET-1CEST,M3.5.0,M10.5.0/3",1);tzset();
     configTime(0, 0, "pool.ntp.org", "time.google.com");
     setenv("TZ","CET-1CEST,M3.5.0,M10.5.0/3",1);tzset();   // timestamps for apcupsd
@@ -1633,7 +1777,7 @@ void loop()
     STAGE(ST_WIFI);
     superviseWiFi(now);
     STAGE(ST_WEB);
-    server.handleClient();
+    if(!wm.getConfigPortalActive())server.handleClient();
 
     STAGE(ST_MQTT);
     connectMqtt();

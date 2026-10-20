@@ -231,7 +231,7 @@ private:
         snprintf(v, sizeof(v), "%u Percent", _ups.lowSocPct);              emit("MBATTCHG", v);
         if (!stale) {
             snprintf(v, sizeof(v), "%.1f Volts", d.invV);                   emit("OUTPUTV", v);
-            snprintf(v, sizeof(v), "%.1f C", bus.getTemp());                 emit("ITEMP", v);
+            if (isfinite(bus.getTemp())) { snprintf(v, sizeof(v), "%.1f C", bus.getTemp()); emit("ITEMP", v); }
             snprintf(v, sizeof(v), "%.1f Volts", bus.getBatVolt());          emit("BATTV", v);
             snprintf(v, sizeof(v), "%.1f Hz", _ups.mainsHz());               emit("LINEFREQ", v);
         }

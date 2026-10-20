@@ -40,7 +40,7 @@ Protocol reference and additional features derived from:
 - **Switch state control** — on, off, charger-only, inverter-only
 - **Firmware version** query (auto-chained two-part request)
 - **Setting & RAM variable info** — query scale, offset, default, min, max
-- Decodes charger/inverter status, LED bitmask, DC current, temperature, AC input limits
+- Decodes charger/inverter status, LED bitmask, DC current, AC input limits
 - Auto-direction support for MAX13487E transceiver
 - Robust frame receiver — line noise or truncated frames cannot overflow buffers
 - Comprehensive constants for RAM IDs, setting IDs, device states, LED/switch bitmasks
@@ -305,10 +305,21 @@ updates (stored in NVS, written at most once a minute).
 | 3551 | apcupsd NIS server |
 | —    | MQTT client → your broker (`<prefix>/state`, `<prefix>/<cmd>/set`) |
 
-**First setup (WiFiManager):** on first boot (or when the saved WiFi is not
-reachable) the device opens an AP named `VEBus-Setup`. The captive portal asks
-for WiFi credentials, the MQTT host/port/user/pass/device-id/topic-prefix and
-a web admin password. Values are persisted to NVS.
+**WiFi setup and recovery (WiFiManager):** without saved WiFi, or if the
+saved network cannot be reached within 15 seconds at startup, the device opens
+`VEBus-Setup`. A sustained disconnect during operation opens it after 20 seconds.
+The captive portal redirects HTTP requests to WiFi setup at
+`http://192.168.4.1/wifi`. Phones/PCs generally offer a sign-in popup;
+if not, open that address manually. HTTPS requests cannot be redirected reliably.
+The setup AP stays available until WiFi connects, without offline reboot loops.
+VE.Bus polling and other loop tasks continue; the existing control timeouts apply.
+Saved-network retries run every 30 seconds when no setup client is attached.
+On success, the AP closes and the dashboard/mDNS/UPS listeners are restored.
+
+The fallback portal only configures WiFi; MQTT, UPS and admin settings remain in
+the authenticated web UI. Firmware upload and destructive WiFiManager routes are
+blocked in the fallback portal. The normal server and portal never listen on port
+80 simultaneously. WiFi credentials are stored by WiFiManager in ESP32 NVS.
 
 **Web UI:** after joining WiFi the device serves
 `http://<device-ip>/` (also `http://<device-id>.local/` via mDNS):
@@ -316,7 +327,7 @@ a web admin password. Values are persisted to NVS.
 | Page | Access | Content |
 |------|--------|---------|
 | `/` | public, read-only | live values, VE.Bus/MQTT/WiFi status, 1 h / 6 h / 24 h charts (power, battery voltage, SoC; 1-minute averages kept in RAM) |
-| `/admin/` | HTTP basic auth, user `admin`, default password `vebus` | ESS setpoint, switch state, battery-neutral mode, charge buttons, MQTT settings, ESS fail-safe timeout, NUT/apcupsd settings (UPS name, credentials, low-battery SoC, nominal power, battery capacity), admin password, OTA firmware upload, reboot, WiFi reset |
+| `/admin/` | Web login with session cookie, user `admin`, default password `vebus` | ESS setpoint, switch state, battery-neutral mode, charge buttons, MQTT settings, ESS fail-safe timeout, NUT/apcupsd settings (UPS name, credentials, low-battery SoC, nominal power, battery capacity), admin password, OTA firmware upload, reboot, WiFi reset |
 
 Change the default password — the dashboard shows a warning until you do.
 JSON endpoints: `/api/state`, `/api/history`, and `/admin/api/debug`
@@ -337,7 +348,7 @@ configurable).
 | `input.voltage/current/frequency/realpower` | mains side |
 | `output.voltage/current/frequency`, `ups.realpower` | AC-out side |
 | `ups.load`, `ups.realpower.nominal` | only when a nominal power is configured |
-| `ups.temperature`, `ups.firmware`, `device.*` | temperature, VE.Bus firmware, identification |
+| `ups.firmware`, `device.*` | VE.Bus firmware, identification; no unverified temperature |
 
 `LB` (the state that makes clients shut down) is raised when the Multiplus
 low-battery LED is on or blinking, or when SoC ≤ the configured threshold
@@ -363,7 +374,7 @@ on TCP port **3551** — `apcaccess -h <device-ip>`, apcupsd slaves
 Assistant "APC UPS Daemon" integration. Reported fields: `STATUS`
 (`ONLINE` / `ONBATT` + `LOWBATT`, `OVERLOAD`; `COMMLOST` without VE.Bus sync),
 `STATFLAG`, `LINEV`, `OUTPUTV`, `LINEFREQ`, `BATTV`, `BCHARGE`, `MBATTCHG`,
-`ITEMP`, `LOADPCT`/`NOMPOWER` (with a nominal power set), `TIMELEFT` (with a
+`LOADPCT`/`NOMPOWER` (with a nominal power set), `TIMELEFT` (with a
 battery capacity set), `NUMXFERS`, `TONBATT`, `CUMONBATT`, `SERIALNO`,
 `FIRMWARE` and NTP-based `DATE`/`STARTTIME`.
 
@@ -374,7 +385,7 @@ it, apcupsd slaves decide on `BCHARGE` and the `LOWBATT` flag only.
 **Robustness:**
 
 - Task watchdog on `loop()` (30 s) — a stalled loop reboots the board.
-- WiFi supervisor — reassociates every 30 s while offline, reboots after 10 min.
+- WiFi supervisor — retries the saved network and opens a nonblocking setup AP after 20 s offline; no reboot just for missing WiFi.
 - WiFi modem sleep disabled (keeps the web UI responsive).
 - MQTT: 5 s socket timeout, reconnect every 5 s, HA discovery sent one entity
   per loop pass and re-sent when HA restarts (`homeassistant/status`).
@@ -387,7 +398,7 @@ it, apcupsd slaves decide on `BCHARGE` and the `LOWBATT` flag only.
   dashboard also names the part of the firmware that was running ("in mqtt",
   "in web server", …).
 - Bus silence: the transceiver is enabled only after the UART is set up, and
-  every orderly restart (reboot button, OTA, WiFi supervisor) and the whole
+  every orderly restart (reboot button, OTA) and the whole
   OTA upload mute the bus first. No automatic wake-up while muted.
 - Web, NUT, apcupsd and mDNS servers are restarted after a WiFi reconnect.
 
@@ -410,7 +421,7 @@ state topic automatically through discovery (entity ids are unchanged).
 | Battery Voltage | `bat_volt` | `getBatVolt()` | V |
 | AC Power | `ac_power` | `getACPower()` | W |
 | DC Current | `dc_current` | `getDCCurrent()` | A |
-| Temperature | `temp` | `getTemp()` | °C |
+| Internal WR temperature (unavailable) | `temp: null` | `getTemp()` returns NAN | — |
 | Charger Status | `charger_status` | `getChargerStatus()` | — |
 | ESS Power | `ess_power` | local setpoint (virtual setpoint when virtual mode on) | W |
 | Effective ESS Power | `ess_power_eff` | what's actually sent to the inverter | W |
@@ -668,7 +679,7 @@ These values are updated continuously without sending any commands:
 ```cpp
 // Frame 0x80 — Charger/Inverter condition
 float getDCCurrent();              // battery current [A]
-float getTemp();                   // device temperature [°C]
+float getTemp();                   // NAN: internal device temperature unavailable
 byte  getChargerStatus();          // operating mode byte
 bool  dcLevelAllowsInverting();    // battery voltage sufficient?
 
@@ -957,3 +968,109 @@ valid input arrives; absent input keeps the setpoint at zero. Manual disabling
 lasts until the next reboot. The read-only build never auto-enables control. If
 the HTTP worker cannot be created, auto mode stays off. Saved manual/automatic
 power and virtual mode are never replayed on startup.
+
+
+PV-Ladefreigabe: Automatik prüft zusätzlich `pvPower`, `homePower` und sämtliche
+`loadpoints[].chargePower` aus evcc. Laden benötigt sowohl in dieser PV-Bilanz als
+auch in Netz-/Batteriebilanz Überschuss. 50 W bleiben als Puffer; BYD-Entladung
+über die einstellbare Schwelle (Standard 100 W) sperrt Laden. Sinkender Überschuss reduziert die Ladung ohne Abwärtsrampe.
+Fehlende PV-/Verbrauchswerte sperren nur das automatische Laden. Beispiel:
+800 W PV, 500 W Haus, keine Wallbox ergibt maximal 250 W Ladung.
+Dies begrenzt den angeforderten Sollwert; weiterlaufende gemessene Ladung bei
+Sollwert 0 W muss am MultiPlus/ESS und anhand frischer Messwerte untersucht werden.
+
+Automatik-Einstellungen: `byd_threshold_w` (0–1000 W, Standard 100 W)
+und `data_timeout_s` (5–120 s, Standard 35 s) sind im Web-UI einstellbar,
+in NVS gespeichert und in `/api/auto` sowie MQTT `/state` verfügbar.
+Bei fehlenden/unvollständigen evcc-Daten wird der letzte Sollwert bis zum
+Timeout seit dem letzten vollständigen Datensatz gehalten; keine Erhöhung
+mit alten Daten. Nach Ablauf 0 W. Neustart wartet weiterhin mit 0 W auf echte
+Messwerte. VE.Bus-/Batteriemesswertverlust und Spannungsschutz bleiben sofort wirksam.
+Frisch gemeldete BYD-Entladung oberhalb der Schwelle beendet eine Ladung sofort.
+
+
+Admin-Anmeldung: `/login` bietet ein Formular mit dem bisherigen Benutzernamen
+`admin` und dem bestehenden Admin-Passwort. Browser-Basic-Auth wurde ersetzt.
+"Angemeldet bleiben" setzt ein HttpOnly-/SameSite=Strict-Cookie für 30 Tage;
+ohne Haken ist es ein Browser-Sitzungscookie. Bis zu vier Sitzungen bleiben
+über Geräte-Neustarts erhalten; weitere Logins ersetzen die älteste Sitzung.
+NVS enthält ausschließlich SHA-256-Token-Digests. Bei gültiger Gerätezeit wird
+auch serverseitig nach 30 Tagen abgewiesen; ohne Uhr beginnt diese Frist beim
+ersten gültigen Zeitwert. Abmelden widerruft die aktuelle Sitzung, Passwortwechsel
+alle Sitzungen. Geschützte APIs liefern 401 statt eines Browser-Anmeldedialogs.
+Firmware-Uploads verwenden dieselbe Sitzung. Öffentliche Mess-APIs bleiben verfügbar.
+
+
+Victron-Weboberfläche: OpenDTU-inspirierte obere Navigation und getrennte
+Einstellungsbereiche unter `/admin/#start`, `#automatik`, `#manuell`, `#test`,
+`#statistik`, `#anbindungen`, `#zugang` und `#system`. Desktop-Seitenleiste,
+auf Mobilgeräten Bereichsauswahl. Wechseln blendet nur Inhalte um; Formulare,
+Messwerte und Sollwerte bleiben erhalten. MQTT/USV/Zugang nutzen weiterhin
+die gemeinsame Konfiguration und Schaltfläche zum Speichern.
+
+
+### Projektstruktur und lokale Artefakte
+
+- `examples/mqtt_ha/`: Firmware, Weboberfläche und Steuerungsmodelle.
+- `src/`, `components/`, `compat/`: Bibliothek und Integrationen.
+- `tests/`: dauerhafte Prüfungen; Befehle stehen in `tests/README.md`.
+- `docs/diagnostics/`: historische Rohdaten der VE.Bus-Diagnose.
+- `.pio/build/`, `.pio/libdeps/`: lokal erzeugte Build-Dateien und Abhängigkeiten.
+- `.pio/firmware-victron-navigation.bin`: aktuelle vorbereitete LilyGo-Update-Datei.
+
+Die Update-Datei ist ein lokales, von Git ignoriertes Build-Artefakt.
+Nach Quellcodeänderungen neu bauen; die Kopie aktualisiert sich nicht automatisch.
+Temporäre Browserprofile, Vorschauen, Sicherungskopien und alte Firmware-Kopien
+gehören nicht in den Quellbaum.
+
+
+Dashboard: Die große Verbindungsmeldung und das statische Netz–MultiPlus–Batterie-
+Schema wurden entfernt. Die kompakten Statusanzeigen zeigen weiterhin VE.Bus,
+MQTT und WLAN; fehlende Verbindung macht Messwerte weiterhin als unbekannt kenntlich.
+
+
+OLED-Darstellung: Dashboard und Einstellungsbereiche nutzen die gesamte
+Fensterbreite mit schmalen Außenabständen. Hintergrund und Karten sind echt
+schwarz, Konturen und Bedienelemente türkis; Diagramme verwenden unterscheidbare
+Messreihenfarben. Die Anmeldemaske bleibt schmal und zentriert. Auf Mobilgeräten
+werden Karten und Formulare gestapelt.
+
+
+Designauswahl oben rechts: **OLED Türkis**, **Nachtblau** und **Graphit**.
+Die Auswahl gilt für Dashboard, Einstellungen und Anmeldung. Sie wird pro Browser
+unter `vebus-theme` gespeichert, ohne Passwörter oder Geräteparameter anzutasten.
+Standard ist OLED Türkis. Wechsel aktualisieren auch die Diagrammfarben ohne
+Neuladen; ungespeicherte Formulareingaben bleiben erhalten. Alle Designs bleiben
+dunkel und verwenden die volle Fensterbreite.
+
+
+### Eigene Informationsseite
+
+`/info/system` ist die öffentliche, ausschließlich lesende Systemübersicht.
+Sie zeigt Hostname, Betriebszeit, CPU-Frequenz, Neustartursache sowie Firmware-,
+Hardware-, Heap-, App-Partitions- und Verbindungsinformationen aus `/api/system`.
+Die Speicherbelegung bezieht sich jeweils auf den Heap bzw. die aktive
+App-Partition; die physische Flash-Größe wird separat angegeben.
+
+Die VE.Bus-Messwertdiagnose wurde aus dem Dashboard auf diese Seite verschoben.
+`/info` und `/info/` leiten auf `/info/system` weiter. Eine CPU-Temperatur,
+frühere Laufzeiten und eine Reset-Historie werden nicht erfunden; eine solche
+Historie wird bisher nicht aufgezeichnet. Alle drei Designs sind verfügbar.
+
+
+### Korrektur der Temperaturanzeige
+
+Die frühere Temperaturberechnung `frame[15] * 0.1` aus dem 0x80-Broadcast war
+nicht durch eine dokumentierte Temperaturkodierung belegt. Ein einzelnes Byte
+mit diesem Faktor kann ohnehin nur 0–25,5 ergeben. Die interne MultiPlus-II-
+Temperatur ist laut Victron nicht als numerischer Messwert zugänglich:
+https://community.victronenergy.com/t/multiplus-ii-internal-temperature/9691
+
+Der dokumentierte Batterie-Temperaturwert über RAM-ID 21 ist ein anderer Sensor
+und wird nicht als Ersatz für die interne WR-Temperatur verwendet:
+https://github.com/victronenergy/venus/issues/374
+
+`getTemp()` gibt deshalb `NAN` (unbekannt) zurück. Web-/MQTT-State liefern
+`temp: null` und `temp_available: false`; die Web-UI zeigt „WR-Temperatur:
+Nicht verfügbar“. NUT und apcupsd lassen den unbelegten Temperaturwert weg.
+Es wird weder ein Multiplikator noch eine Ersatztemperatur geraten.

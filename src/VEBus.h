@@ -368,7 +368,10 @@ public:
 
     // --- From frame 0x80 (charger/inverter condition, broadcast) ---
     float   getDCCurrent()   const { return _multiplusDcCurrent; }
-    float   getTemp()        const { return _multiplusTemp; }
+    // Internal MultiPlus temperature is not exposed as a documented numeric
+    // reading. Preserve API compatibility, but never infer Celsius from an
+    // undocumented broadcast byte. Battery sensor RAM 21 is a separate value.
+    float   getTemp()        const { return NAN; }
     byte    getChargerStatus()  const { return _multiplusStatus80; }
     bool    dcLevelAllowsInverting() const { return _multiplusDcLevelAllowsInverting; }
 
@@ -489,7 +492,6 @@ private:
     volatile uint32_t      _chksmfault;
 
     // Decoded device data — frame 0x80 (broadcast)
-    volatile float   _multiplusTemp;
     volatile float   _multiplusDcCurrent;
     volatile byte    _multiplusStatus80;
     volatile bool    _multiplusDcLevelAllowsInverting;

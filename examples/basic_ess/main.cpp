@@ -291,7 +291,8 @@ void loop()
         Serial.printf("  Battery voltage : %.2f V\n",  vebus.getBatVolt());
         Serial.printf("  AC power        : %d W\n",    vebus.getACPower());
         Serial.printf("  DC current      : %.1f A\n",  vebus.getDCCurrent());
-        Serial.printf("  Temperature     : %.1f C\n",  vebus.getTemp());
+        if(isfinite(vebus.getTemp()))Serial.printf("  Temperature     : %.1f C\n",vebus.getTemp());
+        else Serial.println("  Temperature     : unavailable (internal sensor not exposed)");
         if (vebus.isVirtualSetpointMode()) {
             Serial.printf("  ESS setpoint    : virtual=%d W  effective=%d W  AC-out=%d W\n",
                           (int)vebus.getVirtualSetpoint(),

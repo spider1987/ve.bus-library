@@ -15,7 +15,7 @@ VEBus::VEBus()
       _lastSentType(VEBUS_CMD_READ_RAM),
       _syncrxed(false), _nosync(false), _gotMP2data(false), _acked(false),
       _synctime(0), _syncUs(0), _txEnabled(true), _chksmfault(0),
-      _multiplusTemp(0.0f), _multiplusDcCurrent(0.0f),
+      _multiplusDcCurrent(0.0f),
       _multiplusStatus80(0), _multiplusDcLevelAllowsInverting(false),
       _masterMultiLED_LEDon(0), _masterMultiLED_LEDblink(0),
       _masterMultiLED_Status(0), _masterMultiLED_AcInputConfiguration(0),
@@ -650,8 +650,8 @@ void VEBus::_decodeFrame(const char *frame, int len)
             _multiplusDcLevelAllowsInverting = ((byte)frame[6] & 0x01) != 0;
             int16_t t = 256 * (uint8_t)frame[10] + (uint8_t)frame[9];
             _multiplusDcCurrent = 0.1f * (float)t;
-            if (((byte)frame[11] & 0xF0) == 0x30)
-                _multiplusTemp = 0.1f * (float)(uint8_t)frame[15];
+            // No documented numeric internal-temperature field here.
+            // In particular, frame[15] * 0.1 was an unverified interpretation.
         }
         break;
 

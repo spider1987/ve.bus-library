@@ -364,7 +364,7 @@ private:
             snprintf(v, sizeof(v), "%u", _ups.nominalW);           emit("ups.realpower.nominal", v);
             snprintf(v, sizeof(v), "%.0f", _ups.loadPct());        emit("ups.load", v);
         }
-        snprintf(v, sizeof(v), "%.1f", bus.getTemp());             emit("ups.temperature", v);
+        if (isfinite(bus.getTemp())) { snprintf(v, sizeof(v), "%.1f", bus.getTemp()); emit("ups.temperature", v); }
         if (d.socValid) {
             snprintf(v, sizeof(v), "%.0f", _ups.socPct());         emit("battery.charge", v);
         }
