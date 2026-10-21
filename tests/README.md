@@ -35,3 +35,5 @@ Einstellungsbereiche einschließlich der separaten Infoseite bei 1920, 1366, 760
 Testserver. Screenshots mit simulierten Werten liegen in `.pio/build/ui-preview/`;
 das temporäre Browserprofil wird nach dem Test entfernt. Ein abweichender
 Chrome-Pfad kann über `CHROME_PATH` gesetzt werden.
+
+`node tests/auto_priority_settings_ui.cjs` prüft BYD-Ladeziel, Wiederanlaufwerte, die erforderliche Abschaltspannung und die Anzeige gespeicherter Einstellungen. AutoPower.h enthält C++11-kompatible Compile-Time-Prüfungen für SoC-/Solar-Freigaben und durchgehende Überschusszeit einschließlich Datenlücken und millis-Überlauf. Physischer OFF/ON-Zyklus wurde damit nicht getestet.

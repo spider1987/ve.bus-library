@@ -204,9 +204,17 @@ bool     g_otaAuthed      = false;
 bool     g_essDirty       = false;   // ESS setpoint / virtual mode not yet in NVS
 uint32_t g_essSavedMs     = 0;
 
-struct AutoSettings { uint16_t chargeW=3000, dischargeW=3000; uint8_t sharePct=90; uint16_t bydThresholdW=100, dataTimeoutS=35; float cutoffV=0, resumeDeltaV=1; } autoCfg;
+struct AutoSettings { uint16_t chargeW=3000, dischargeW=3000; bool sleepAtCutoff=false; uint8_t bydMinSoc=0; uint16_t wakeMinW=200, wakeDelayS=30; uint8_t sharePct=90; uint16_t bydThresholdW=100, dataTimeoutS=35; float cutoffV=0, resumeDeltaV=1; } autoCfg;
+static bool autoLowLock=false, autoSleeping=false;
+static uint32_t autoSwitchMs=0, autoWakeMs=0;
+static AutoPower::SurplusTimer autoSurplusTimer;
+static void saveAutoSleep(bool locked) {
+    if(autoLowLock==locked)return;
+    autoLowLock=locked;
+    Preferences sp;sp.begin("vebus_mqtt",false);sp.putBool("autolow",locked);sp.end();
+}
 static bool voltageBlocked = false;
-static bool dischargeBlocked() { return autoCfg.cutoffV>0 && (voltageBlocked || !batFresh(millis())); }
+static bool dischargeBlocked() { return autoLowLock || (autoCfg.cutoffV>0 && (voltageBlocked || !batFresh(millis()))); }
 static void updateVoltageGuard() {
     if (autoCfg.cutoffV<=0) voltageBlocked=false;
     else if(batFresh(millis())) voltageBlocked=AutoPower::voltageLatch(voltageBlocked,batSampleV,autoCfg.cutoffV,autoCfg.resumeDeltaV);
@@ -283,7 +291,7 @@ static const EnergyDay *yesterdayEnergy() {
 }
 
 // evcc snapshots are read on a separate task: HTTP never blocks VE.Bus/UI.
-struct AutoSnapshot { bool valid, solarValid; uint32_t atMs; int gridW, otherW, victronW, demandW, solarResidualW; };
+struct AutoSnapshot { bool valid, solarValid, bydSocValid; float bydSoc; uint32_t atMs; int gridW, otherW, victronW, demandW, solarResidualW; };
 static QueueHandle_t autoQueue = nullptr;
 static bool autoEnabled = false, autoHaveSample = false;
 static AutoSnapshot autoSample = {};
@@ -307,6 +315,7 @@ static void autoWorker(void *) {
                     filter["homePower"] = true; filter["pvPower"] = true;
                     filter["loadpoints"][0]["chargePower"] = true;
                     filter["battery"]["devices"][0]["power"] = true;
+                    filter["battery"]["devices"][0]["soc"] = true;
                     DynamicJsonDocument doc(4096);
                     const DeserializationError err = deserializeJson(doc, http.getStream(), DeserializationOption::Filter(filter));
                     JsonArray devices = doc["battery"]["devices"].as<JsonArray>();
@@ -320,6 +329,11 @@ static void autoWorker(void *) {
                             // Grid + all batteries = consumption minus PV (includes EV loads).
                             snap.demandW = snap.gridW + snap.otherW + snap.victronW;
                             snap.valid = true;
+                            if(devices[0]["soc"].is<float>()) {
+                                const float soc=devices[0]["soc"];
+                                snap.bydSocValid=isfinite(soc)&&soc>=0&&soc<=100;
+                                if(snap.bydSocValid)snap.bydSoc=soc;
+                            }
                             // Explicit solar gate: include EV consumption, never substitute missing values.
                             if(doc["homePower"].is<float>() && doc["pvPower"].is<float>() && doc["loadpoints"].is<JsonArray>()) {
                                 float home=doc["homePower"], pv=doc["pvPower"], ev=0;
@@ -353,44 +367,87 @@ static void autoStop() {
     autoEnabled = false; autoWanted = 0; autoReason = "Aus · Sollwert 0 W";
     autoSetPower(0);
 }
+// Only an automatic low-voltage shutdown is automatically reversed.
+static void autoSleep(uint32_t now) {
+    autoWanted=0;autoSetPower(0);
+    saveAutoSleep(true);autoSleeping=true;autoSwitchMs=now;
+    autoSurplusTimer.reset();autoWakeMs=now;
+    vebus.setSwitchState(VEBUS_SWITCH_STATE_OFF);
+    autoReason="Mindestspannungs-Abschaltung angefordert · warte auf PV und BYD-Freigabe";
+}
 static void autoLoop(uint32_t now) {
     AutoSnapshot next;
-    bool updated = autoQueue && xQueueReceive(autoQueue, &next, 0) == pdTRUE;
+    const bool updated=autoQueue && xQueueReceive(autoQueue,&next,0)==pdTRUE;
     const bool complete=updated && next.valid && next.solarValid;
-    // An incomplete HTTP response must not overwrite the last usable timestamp.
     if(complete){autoSample=next;autoHaveSample=true;}
-    if(autoEnabled && updated && next.valid && g_essPower<0 && next.otherW>autoCfg.bydThresholdW) {
-        autoWanted=0;autoSetPower(0);autoReason="Pausiert · BYD entlädt";
+    if(!autoEnabled)return;
+    // Fresh voltage, not a stale/no-data guard, may trigger a device shutdown.
+    if(autoCfg.sleepAtCutoff && autoCfg.cutoffV>0 && !autoLowLock && batFresh(now) &&
+       batSampleV<=autoCfg.cutoffV && (vebus.getSwitchRegister()&(VEBUS_SWITCH_CHARGE|VEBUS_SWITCH_INVERT)) && vebus.isTxEnabled()) { autoSleep(now);return; }
+    if(autoLowLock && autoSleeping) {
+        autoWanted=0;if(g_essPower)autoSetPower(0);
+        // OFF may stop AC/voltage reports. Wake uses fresh external PV balance only.
+        const bool ready=AutoPower::wakeReady(autoEnabled,complete,complete?now-next.atMs:0,
+            complete&&next.solarValid,complete?next.demandW:0,complete?next.solarResidualW:0,
+            complete?next.otherW:0,autoCfg.bydThresholdW,autoCfg.bydMinSoc,
+            complete&&next.bydSocValid,complete?next.bydSoc:0,autoCfg.wakeMinW,autoCfg.chargeW);
+        if(updated && !ready)autoSurplusTimer.reset();
+        if(!autoHaveSample || now-autoSample.atMs>7500)autoSurplusTimer.reset();
+        const bool stable=ready && autoSurplusTimer.observe(true,now,autoCfg.wakeDelayS);
+        autoReason=autoSurplusTimer.tracking?"Warte · PV-Überschuss stabilisieren":"Mindestspannungs-Abschaltung · warte auf PV / BYD-Mindestladestand";
+        if(stable &&
+           now-autoWakeMs>=30000 && vebus.isTxEnabled()) {
+            autoSetPower(0);vebus.enableVirtualSetpointMode(false);
+            vebus.setSwitchState(VEBUS_SWITCH_STATE_ON);
+            autoSleeping=false;autoWakeMs=now;autoSurplusTimer.reset();
+            autoReason="Einschalten angefordert · warte auf frische VE.Bus-Werte";
+        } else if(vebus.isTxEnabled() && now-autoSwitchMs>=15000) {
+            vebus.setSwitchState(VEBUS_SWITCH_STATE_OFF);autoSwitchMs=now;
+        }
+        return;
     }
-    if (!autoEnabled) return;
-    const int limited=AutoPower::bounded(g_essPower,autoCfg.chargeW,autoCfg.dischargeW);
-    if(limited!=g_essPower)autoSetPower(limited);
-    if(dischargeBlocked() && autoWanted>0){autoWanted=0;autoReason="Entladesperre · Batteriespannung";}
-    if(!acFresh(now) || !batFresh(now) || !vebus.isTxEnabled()) {
-        autoReason="Pausiert · VE.Bus-Messwerte fehlen";autoWanted=0;
-        if(g_essPower)autoSetPower(0);
+    if(autoLowLock && ((int32_t)(batSampleMs-autoWakeMs)<=0 || (int32_t)(acMainsMs-autoWakeMs)<=0 ||
+       (vebus.getSwitchRegister() & (VEBUS_SWITCH_CHARGE|VEBUS_SWITCH_INVERT))!=(VEBUS_SWITCH_CHARGE|VEBUS_SWITCH_INVERT))) {
+        autoWanted=0;if(g_essPower)autoSetPower(0);
+        autoReason="Einschalten angefordert · warte auf Bestätigung und neue Messwerte";
+        if(now-autoWakeMs>=20000 && vebus.isTxEnabled())autoSleep(now);
+        return;
+    }
+    // Recover only after actual charging has raised battery voltage; no voltage rebound wake.
+    if(autoLowLock && batFresh(now) && batSampleA>0.5f && batSampleV>=autoCfg.cutoffV+autoCfg.resumeDeltaV)
+        saveAutoSleep(false);
+    if(!acFresh(now)||!batFresh(now)||!vebus.isTxEnabled()) {
+        autoWanted=0;if(g_essPower)autoSetPower(0);
+        autoReason="Pausiert · VE.Bus-Messwerte fehlen";
+        if(autoLowLock && now-autoWakeMs>=20000 && vebus.isTxEnabled())autoSleep(now);
         return;
     }
     if(!AutoPower::holdEvcc(autoHaveSample,now-autoSample.atMs,autoCfg.dataTimeoutS)) {
-        autoReason="Pausiert · evcc-Datenzeit abgelaufen";autoWanted=0;
-        if(g_essPower)autoSetPower(0);
+        autoWanted=0;if(g_essPower)autoSetPower(0);
+        autoReason="Pausiert · evcc-Datenzeit abgelaufen";
+        if(autoLowLock)autoSleep(now);
         return;
     }
-    if(!complete) {
-        g_lastEssCmdMs=now;
-        if(now-autoSample.atMs>7500)autoReason="Warte auf evcc · letzten Sollwert halten";
+    // A fresh BYD power/SoC rejection reduces charge immediately, even if other fields are missing.
+    if(updated && next.valid && g_essPower<0 &&
+       (next.otherW>autoCfg.bydThresholdW || !AutoPower::priorityReady(autoCfg.bydMinSoc,next.bydSocValid,next.bydSoc))) {
+        autoWanted=0;autoSetPower(0);autoReason="Pausiert · BYD-Ladepriorität / Entladung";
+        if(autoLowLock)autoSleep(now);
         return;
     }
-    autoWanted = AutoPower::target(autoSample.demandW, autoSample.otherW,autoCfg.chargeW,autoCfg.dischargeW,autoCfg.sharePct,autoCfg.bydThresholdW);
-    autoWanted=AutoPower::solarGate(autoWanted,autoSample.solarValid,autoSample.solarResidualW,autoSample.otherW,autoCfg.chargeW,autoCfg.bydThresholdW);
-    const bool voltageStop=autoWanted>0 && dischargeBlocked();
-    if(voltageStop)autoWanted=0;
-    autoReason = autoSample.demandW>100 && (!autoCfg.dischargeW || !autoCfg.sharePct) ? "Entladen deaktiviert" : autoSample.demandW< -100 && !autoCfg.chargeW ? "Laden deaktiviert" : voltageStop ? "Entladesperre · Batteriespannung" : autoWanted > 0 ? "Entladen · eingestellter Victron-Anteil" : autoWanted < 0 ? "Laden · PV-Überschuss" :
-        autoSample.demandW < -100 && !autoSample.solarValid ? "Pausiert · PV-/Verbrauchsmesswerte fehlen" :
-        autoSample.demandW < -100 && autoSample.solarResidualW >= -100 ? "Bereit · kein gesicherter PV-Überschuss" :
-        autoSample.demandW < -100 && autoSample.otherW > autoCfg.bydThresholdW ? "Pausiert · BYD entlädt" :
-        autoSample.demandW > 100 && autoSample.otherW < -150 ? "Pausiert · BYD lädt" : "Bereit · Totzone";
-    autoSetPower(AutoPower::approach(g_essPower, autoWanted));
+    if(!complete){g_lastEssCmdMs=now;if(now-autoSample.atMs>7500)autoReason="Warte auf evcc · letzten Sollwert halten";return;}
+    int wanted=AutoPower::target(autoSample.demandW,autoSample.otherW,autoCfg.chargeW,autoCfg.dischargeW,autoCfg.sharePct,autoCfg.bydThresholdW);
+    wanted=AutoPower::solarGate(wanted,autoSample.solarValid,autoSample.solarResidualW,autoSample.otherW,autoCfg.chargeW,autoCfg.bydThresholdW);
+    const bool priorityStop=wanted<0 && !AutoPower::priorityReady(autoCfg.bydMinSoc,autoSample.bydSocValid,autoSample.bydSoc);
+    wanted=AutoPower::chargePriority(wanted,autoCfg.bydMinSoc,autoSample.bydSocValid,autoSample.bydSoc);
+    const bool voltageStop=wanted>0 && (dischargeBlocked()||autoLowLock);
+    autoWanted=voltageStop?0:wanted;
+    // A low-voltage wake is for solar charging only; stop again when usable surplus disappears.
+    if(autoLowLock && autoWanted>=0){autoSleep(now);return;}
+    autoReason=priorityStop?"Warte · BYD-Mindestladestand nicht erreicht / fehlt":voltageStop?"Entladesperre · Batteriespannung":
+        autoWanted>0?"Entladen · eingestellter Victron-Anteil":autoWanted<0?"Laden · PV-Überschuss":
+        autoSample.otherW>autoCfg.bydThresholdW?"Pausiert · BYD entlädt":"Bereit · kein freigegebener Bedarf / Überschuss";
+    autoSetPower(AutoPower::approach(g_essPower,autoWanted));
 }
 
 // Breadcrumb: which part of loop() was running. Survives a watchdog reset
@@ -534,6 +591,11 @@ static void loadConfig()
     cfg.nominalW    =      prefs.getUShort("nomw",    0);
     cfg.apcEnabled  =      prefs.getBool("apc",       true);
     cfg.batteryWh   =      prefs.getUShort("batwh",   0);
+    autoCfg.sleepAtCutoff=prefs.getBool("autosleep",false);
+    autoCfg.bydMinSoc=prefs.getUChar("autobydsoc",0);if(autoCfg.bydMinSoc>100)autoCfg.bydMinSoc=0;
+    autoCfg.wakeMinW=prefs.getUShort("autowakew",200);if(autoCfg.wakeMinW<100||autoCfg.wakeMinW>10000)autoCfg.wakeMinW=200;
+    autoCfg.wakeDelayS=prefs.getUShort("autowakes",30);if(autoCfg.wakeDelayS<10||autoCfg.wakeDelayS>600)autoCfg.wakeDelayS=30;
+    autoLowLock=prefs.getBool("autolow",false);autoSleeping=autoLowLock;
     autoCfg.bydThresholdW=prefs.getUShort("autobyd",100);
     autoCfg.dataTimeoutS=prefs.getUShort("autowait",35);
     if(autoCfg.bydThresholdW>1000)autoCfg.bydThresholdW=100;
@@ -573,6 +635,8 @@ static void saveConfig()
     prefs.putUShort("nomw",    cfg.nominalW);
     prefs.putBool("apc",       cfg.apcEnabled);
     prefs.putUShort("batwh",   cfg.batteryWh);
+    prefs.putBool("autosleep",autoCfg.sleepAtCutoff);prefs.putUChar("autobydsoc",autoCfg.bydMinSoc);
+    prefs.putUShort("autowakew",autoCfg.wakeMinW);prefs.putUShort("autowakes",autoCfg.wakeDelayS);
     prefs.putUShort("autobyd",autoCfg.bydThresholdW);prefs.putUShort("autowait",autoCfg.dataTimeoutS);
     prefs.putUChar("autoshare",autoCfg.sharePct);
     prefs.putUShort("autocw",autoCfg.chargeW);prefs.putUShort("autodw",autoCfg.dischargeW);
@@ -641,6 +705,9 @@ static bool handleCommand(const char *cmd, const char *arg, const char *src)
     if (autoEnabled) {
         if (!strcmp(cmd, "ess_power") || !strcmp(cmd, "virtual_mode")) return false;
         if (strcmp(cmd, "sync_soc")) autoStop();
+    }
+    if((!strcmp(cmd,"switch_state") && (!strcmp(arg,"on")||!strcmp(arg,"off")||!strcmp(arg,"charger_only")||!strcmp(arg,"inverter_only")))||!strcmp(cmd,"wakeup")||!strcmp(cmd,"sleep")) {
+        saveAutoSleep(false);autoSleeping=false;autoSurplusTimer.reset();
     }
     if (!strcmp(cmd, "ess_power")) {
         if (!arg || !*arg) return false;
@@ -761,6 +828,7 @@ static void buildStateJson(Buf &j)
     char dayStart[32];dayStartText(dayStart,sizeof(dayStart));j.add("\"energy_day_start\":");if(timeValid)j.str(dayStart);else j.add("null");j.add(",");
     j.add("\"auto_byd_threshold_w\":%u,\"auto_data_timeout_s\":%u,",autoCfg.bydThresholdW,autoCfg.dataTimeoutS);
     j.add("\"auto_share_pct\":%u,",autoCfg.sharePct);
+    j.add("\"auto_sleep_at_cutoff\":%s,\"auto_low_voltage_lock\":%s,\"auto_sleeping\":%s,\"auto_byd_min_soc\":%u,\"auto_wake_min_w\":%u,\"auto_wake_delay_s\":%u,",autoCfg.sleepAtCutoff?"true":"false",autoLowLock?"true":"false",autoSleeping?"true":"false",autoCfg.bydMinSoc,autoCfg.wakeMinW,autoCfg.wakeDelayS);
     j.add("\"auto_enabled\":%s,\"auto_charge_limit_w\":%u,\"auto_discharge_limit_w\":%u,\"auto_cutoff_v\":%.2f,\"auto_resume_delta_v\":%.2f,",autoEnabled?"true":"false",autoCfg.chargeW,autoCfg.dischargeW,autoCfg.cutoffV,autoCfg.resumeDeltaV);
     j.add("\"energy_total_charge_kwh\":%.6f,\"energy_total_discharge_kwh\":%.6f,",energyBook.chargeWh/1000,energyBook.dischargeWh/1000);
     if(timeValid)j.add("\"energy_today_charge_kwh\":%.6f,\"energy_today_discharge_kwh\":%.6f,",today?today->chargeWh/1000:0,today?today->dischargeWh/1000:0);
@@ -1295,8 +1363,11 @@ static void handlePostConfig()
 }
 
 static void handleAutoState() {
-    StaticJsonDocument<1024> doc;
+    StaticJsonDocument<1536> doc;
     doc["enabled"]=autoEnabled;doc["fresh"]=autoHaveSample&&autoSample.valid&&millis()-autoSample.atMs<=15000;
+    doc["sleep_at_cutoff"]=autoCfg.sleepAtCutoff;doc["sleeping"]=autoSleeping;doc["low_voltage_lock"]=autoLowLock;
+    doc["byd_min_soc"]=autoCfg.bydMinSoc;doc["wake_min_w"]=autoCfg.wakeMinW;doc["wake_delay_s"]=autoCfg.wakeDelayS;
+    if(autoHaveSample&&autoSample.bydSocValid)doc["byd_soc"]=autoSample.bydSoc;else doc["byd_soc"]=nullptr;
     doc["byd_threshold_w"]=autoCfg.bydThresholdW;doc["data_timeout_s"]=autoCfg.dataTimeoutS;
     doc["data_age_s"]=autoHaveSample?(millis()-autoSample.atMs)/1000:0;
     doc["status"]=autoReason;doc["share_pct"]=autoCfg.sharePct;doc["target_w"]=autoWanted;doc["setpoint_w"]=g_essPower;
@@ -1316,16 +1387,23 @@ static void handleAutoConfig() {
 #ifdef VEBUS_READ_ONLY
     sendJson("{\"ok\":false,\"error\":\"Nur-Lesen-Firmware\"}",403);return;
 #endif
+    double soc=autoCfg.bydMinSoc,wakeW=autoCfg.wakeMinW,wakeS=autoCfg.wakeDelayS,sleep=autoCfg.sleepAtCutoff?1:0;
     double charge,discharge,cutoff,delta,share=autoCfg.sharePct,byd=autoCfg.bydThresholdW,wait=autoCfg.dataTimeoutS;
-    if((server.hasArg("byd_threshold_w")&&!autoNumber("byd_threshold_w",byd))||byd<0||byd>1000||floor(byd)!=byd||
+    if((server.hasArg("byd_min_soc")&&!autoNumber("byd_min_soc",soc))||soc<0||soc>100||floor(soc)!=soc||
+       (server.hasArg("sleep_at_cutoff")&&!autoNumber("sleep_at_cutoff",sleep))||(sleep!=0&&sleep!=1)||
+       (server.hasArg("wake_min_w")&&!autoNumber("wake_min_w",wakeW))||wakeW<100||wakeW>10000||floor(wakeW)!=wakeW||
+       (server.hasArg("wake_delay_s")&&!autoNumber("wake_delay_s",wakeS))||wakeS<10||wakeS>600||floor(wakeS)!=wakeS||
+       (server.hasArg("byd_threshold_w")&&!autoNumber("byd_threshold_w",byd))||byd<0||byd>1000||floor(byd)!=byd||
        (server.hasArg("data_timeout_s")&&!autoNumber("data_timeout_s",wait))||wait<5||wait>120||floor(wait)!=wait||
        !autoNumber("charge_limit_w",charge)||!autoNumber("discharge_limit_w",discharge)||
        !autoNumber("cutoff_v",cutoff)||!autoNumber("resume_delta_v",delta)||
        (server.hasArg("share_pct")&&!autoNumber("share_pct",share))||share<0||share>100||floor(share)!=share||
        charge<0||charge>32767||floor(charge)!=charge||discharge<0||discharge>32767||floor(discharge)!=discharge||
-       (cutoff!=0&&(cutoff<38||cutoff>60))||delta<.1||delta>5) {
-        sendJson("{\"ok\":false,\"error\":\"Victron-Anteil: 0–100 % ganzzahlig; Leistung: ganze Watt ab 0; Spannung: 0 oder 38–60 V; Hysterese: 0,1–5 V\"}",400);return;
+       (cutoff!=0&&(cutoff<38||cutoff>60))||(sleep==1&&(cutoff==0||(charge>0&&wakeW>charge)))||delta<.1||delta>5) {
+        sendJson("{\"ok\":false,\"error\":\"BYD-Ziel: 0–100 %; Wiederanlauf: 100–10000 W, 10–600 s; Abschalten benötigt eine Spannungsgrenze und einen Wiederanlaufwert bis zur Ladegrenze; Leistungs-/Spannungsgrenzen prüfen\"}",400);return;
     }
+    autoCfg.sleepAtCutoff=sleep==1;autoCfg.bydMinSoc=soc;autoCfg.wakeMinW=wakeW;autoCfg.wakeDelayS=wakeS;
+    autoSurplusTimer.reset();
     autoCfg.bydThresholdW=byd;autoCfg.dataTimeoutS=wait;
     autoCfg.sharePct=share;autoCfg.chargeW=charge;autoCfg.dischargeW=discharge;autoCfg.cutoffV=cutoff;autoCfg.resumeDeltaV=delta;
     updateVoltageGuard();saveConfig();
@@ -1334,7 +1412,8 @@ static void handleAutoConfig() {
         if(g_essPower>0 && autoHaveSample && autoSample.valid && millis()-autoSample.atMs<=15000) {
             autoWanted=AutoPower::target(autoSample.demandW,autoSample.otherW,autoCfg.chargeW,autoCfg.dischargeW,autoCfg.sharePct,autoCfg.bydThresholdW);
             autoSetPower(min((int)g_essPower,max(0,autoWanted)));
-        } else autoSetPower(g_essPower);
+        } else if(g_essPower<0 && !AutoPower::priorityReady(autoCfg.bydMinSoc,autoSample.bydSocValid,autoSample.bydSoc))autoSetPower(0);
+        else autoSetPower(g_essPower);
     }
     sendJson("{\"ok\":true}");
 }
@@ -1387,7 +1466,7 @@ static void handleAutoControl() {
     const String action = server.arg("action");
     if (action == "off") { autoStop(); sendJson("{\"ok\":true}"); return; }
     if (action != "on") { sendJson("{\"ok\":false,\"error\":\"Ungueltige Aktion\"}",400); return; }
-    if (!autoQueue || acRunning || !acFresh(millis()) || !batFresh(millis())) {
+    if (!autoQueue || acRunning || (!autoSleeping && (!acFresh(millis()) || !batFresh(millis())))) {
         sendJson("{\"ok\":false,\"error\":\"Frische VE.Bus-Werte erforderlich; Batterietest muss beendet sein\"}",409); return;
     }
     // Never restore an automatic power command after a reboot.
@@ -1935,7 +2014,7 @@ void loop()
 
     // Auto-wakeup on no-sync (not while the bus is deliberately muted)
 #if !defined(VEBUS_CONTROL_TEST) && !defined(VEBUS_READ_ONLY)
-    if (vebus.hasNoSync() && vebus.isTxEnabled())
+    if (!autoLowLock && vebus.hasNoSync() && vebus.isTxEnabled())
     {
         static uint32_t lastWakeupMs = 0;
         if (now - lastWakeupMs >= WAKEUP_RETRY_MS)

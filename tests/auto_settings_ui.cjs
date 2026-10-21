@@ -19,6 +19,8 @@ const s = fs.readFileSync("examples/mqtt_ha/web_ui.h", "utf8"),
   ]) {
     let posted = null;
     const els = {
+      autoSleepAtCutoff: { checked: false },
+      autoBydMinSoc: { value: "80" },autoWakeMinW: { value: "200" },autoWakeDelay: { value: "30" },
       autoBydThreshold: { value: String(byd) },
       autoDataTimeout: { value: String(wait) },
       autoSharePct: { value: "90" },
@@ -58,7 +60,7 @@ const s = fs.readFileSync("examples/mqtt_ha/web_ui.h", "utf8"),
     vm.runInContext(script, c);
     await els.autoSettings.onsubmit({ preventDefault() {} });
     if (valid) {
-      assert.equal(posted.byd_threshold_w, byd);
+      assert.equal(posted.byd_threshold_w, byd);assert.equal(posted.byd_min_soc,80);assert.equal(posted.wake_min_w,200);assert.equal(posted.wake_delay_s,30);assert.equal(posted.sleep_at_cutoff,0);
       assert.equal(posted.data_timeout_s, wait);
     } else assert.equal(posted, null);
   }

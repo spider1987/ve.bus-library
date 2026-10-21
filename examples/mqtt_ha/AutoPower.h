@@ -79,3 +79,54 @@ static_assert(target(-300,100)==-250,"100 W BYD tolerance");
 static_assert(target(-300,101)==0,"above configured threshold stops charging");
 static_assert(target(-300,150,3000,3000,90,200)==-250,"configurable BYD tolerance");
 }
+
+namespace AutoPower {
+constexpr bool priorityReady(unsigned minimum, bool valid, float soc) {
+    return minimum == 0 || (valid && soc >= minimum && soc <= 100);
+}
+constexpr int chargePriority(int wanted, unsigned minimum, bool valid, float soc) {
+    return wanted < 0 && !priorityReady(minimum,valid,soc) ? 0 : wanted;
+}
+constexpr bool wakeReady(bool enabled, bool complete, uint32_t age, bool solarValid,
+                         int demand, int solarResidual, int other, int tolerance,
+                         unsigned minimumSoc, bool socValid, float soc, int minimumW, int chargeLimit) {
+    return enabled && complete && age<=7500 && solarValid && chargeLimit>=minimumW &&
+        demand<=-(minimumW+CHARGE_RESERVE) && solarResidual<=-(minimumW+CHARGE_RESERVE) &&
+        other<=tolerance && priorityReady(minimumSoc,socValid,soc);
+}
+static_assert(priorityReady(0,false,0),"disabled priority needs no SoC");
+static_assert(!priorityReady(80,false,90),"missing BYD SoC blocks priority charging");
+static_assert(!priorityReady(80,true,79),"BYD first below minimum");
+static_assert(priorityReady(80,true,80),"inclusive BYD threshold");
+static_assert(chargePriority(1800,80,false,0)==1800,"BYD priority never blocks discharge");
+static_assert(chargePriority(-1000,80,true,79)==0,"BYD priority blocks charging");
+static_assert(wakeReady(true,true,0,true,-300,-300,0,100,80,true,80,200,3000),"real surplus permits wake");
+static_assert(!wakeReady(true,true,0,true,-300,500,0,100,80,true,80,200,3000),"PV deficit forbids wake");
+static_assert(!wakeReady(true,true,0,true,-300,-300,101,100,80,true,80,200,3000),"BYD discharge forbids wake");
+static_assert(!wakeReady(true,true,7501,true,-300,-300,0,100,80,true,80,200,3000),"old snapshot cannot wake");
+}
+
+namespace AutoPower {
+struct SurplusTimer {
+    bool tracking;
+    uint32_t since;
+    constexpr SurplusTimer(bool active=false,uint32_t start=0):tracking(active),since(start){}
+    void reset(){tracking=false;}
+    constexpr SurplusTimer after(bool ready,uint32_t now) const {
+        return !ready?SurplusTimer():tracking?*this:SurplusTimer(true,now);
+    }
+    constexpr bool stable(uint32_t now,unsigned seconds) const {
+        return tracking && (uint32_t)(now-since)>=seconds*1000UL;
+    }
+    bool observe(bool ready,uint32_t now,unsigned stableS) {
+        *this=after(ready,now);return stable(now,stableS);
+    }
+};
+constexpr SurplusTimer timerStart=SurplusTimer().after(true,1000);
+static_assert(!timerStart.stable(30999,30),"do not wake early");
+static_assert(timerStart.stable(31000,30),"continuous surplus for delay permits wake");
+static_assert(!timerStart.after(false,32000).tracking,"missing data resets wake timer");
+constexpr SurplusTimer timerRestart=timerStart.after(false,32000).after(true,33000);
+static_assert(!timerRestart.stable(62000,30)&&timerRestart.stable(63000,30),"restart full delay after a gap");
+static_assert(SurplusTimer(true,0xfffff000UL).stable(25904,30),"wake timer survives millis wrap");
+}

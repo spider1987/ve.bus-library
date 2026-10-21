@@ -1074,3 +1074,39 @@ https://github.com/victronenergy/venus/issues/374
 `temp: null` und `temp_available: false`; die Web-UI zeigt „WR-Temperatur:
 Nicht verfügbar“. NUT und apcupsd lassen den unbelegten Temperaturwert weg.
 Es wird weder ein Multiplikator noch eine Ersatztemperatur geraten.
+
+
+### Automatische Mindestspannungs-Abschaltung und BYD-Ladepriorität
+
+Unter Einstellungen → evcc-Automatik → Leistungsgrenzen & Batterieschutz:
+- `sleep_at_cutoff`: zusätzliche Geräteabschaltung bei der konfigurierten
+  Mindestspannung; standardmäßig aus. Erfordert aktivierten Spannungsschutz.
+- `byd_min_soc`: BYD zuerst auf diesen Ladestand laden (0–100 %, 0 deaktiviert).
+  Bezieht sich ausschließlich auf die Ladefreigabe, nicht auf Lastunterstützung.
+- `wake_min_w`: mindestens verfügbare PV-Ladeleistung für Wiederanlauf,
+  standardmäßig 200 W (zusätzlich 50 W Reserve).
+- `wake_delay_s`: durchgängiger Überschuss vor Wiederanlauf, standardmäßig
+  30 Sekunden, einstellbar 10–600 s. Ungültige evcc-Antworten setzen den Timer zurück.
+
+Der Zustand nach automatischer Unterspannungs-Abschaltung bleibt im NVS über
+Neustarts erhalten. Allgemeines No-sync-Wakeup ist währenddessen gesperrt.
+Wiederanlauf nutzt frische vollständige evcc-Werte, auch wenn der ausgeschaltete
+MultiPlus keine AC-Messwerte mehr liefert. BYD-Entladegrenze und Haus-/EV-/PV-
+Bilanz bleiben wirksam. Nach ON-Anforderung sind Schaltregister-Bestätigung und
+neue AC-/Batteriemesswerte erforderlich; nach 20 s ohne Bestätigung wird OFF
+erneut angefordert. Entladen bleibt bis zum Wiederaufladen über Mindestspannung
+plus Hysterese gesperrt. Fällt nutzbarer Überschuss während dieser Erholung weg,
+wird wieder abgeschaltet. Nach Spannungsfreigabe arbeitet die normale Regelung.
+
+Ein manuelles Schalten beendet die automatische Abschalt-Zuständigkeit.
+Automatik ausschalten weckt den WR nicht. Eine BMS-Abschaltung oder ein physisch
+abgeschaltetes Gerät wird nicht automatisch aufgehoben. Die Fernabschaltung
+kann AC-OUT-Verbraucher unterbrechen; LILYGO muss unabhängig versorgt bleiben.
+Die Befehlsanforderung ist keine bestätigte physische Abschaltung.
+
+`/api/auto` enthält Konfiguration, BYD-SoC und Schutzstatus. Der normale MQTT-
+State ergänzt `auto_sleep_at_cutoff`, `auto_low_voltage_lock`, `auto_sleeping`,
+`auto_byd_min_soc`, `auto_wake_min_w` und `auto_wake_delay_s`.
+
+Protokollgrenzen: https://www.victronenergy.com/media/pg/MultiPlus-II_230V/en/operation.html
+Firmware- und UI-Tests ersetzen keinen Test des Abschalt-/Wiederanlaufzyklus am Gerät.
