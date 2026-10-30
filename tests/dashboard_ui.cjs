@@ -14,8 +14,8 @@ const logic = script.slice(0,script.indexOf('function nice('));
   const context={document:{getElementById:get,querySelectorAll:()=>[]},location:{pathname:'/'},fetch:async()=>{if(mode==='unreachable')throw Error('offline');return {json:async()=>data}}};
   vm.createContext(context);vm.runInContext(logic,context);
   await vm.runInContext('poll()',context);await vm.runInContext('poll()',context);
-  if(mode==='connected'){assert(get('t_bat_volt').innerHTML.includes('49,10'));assert.equal(get('dSync').className,'dot ok');assert.equal(get('t_battery_flow').innerHTML,'Entladen');
-for(const [a,fresh,want] of [[4.3,true,'Laden'],[0,true,'Nahe 0 A'],[0.5,true,'Nahe 0 A'],[-0.5,true,'Nahe 0 A'],[-4.3,false,'Nicht verfügbar'],[null,true,'Nicht verfügbar']]){data.bat_current=a;data.battery_fresh=fresh;await vm.runInContext('poll()',context);assert.equal(get('t_battery_flow').innerHTML,want);}}
+  if(mode==='connected'){assert(get('t_bat_volt').innerHTML.includes('49,10'));assert.equal(get('dSync').className,'dot ok');assert.equal(get('h_bat_current').textContent,'Entladen');
+for(const [a,fresh,want] of [[4.3,true,'Laden'],[0,true,'Nahe 0 A'],[0.5,true,'Nahe 0 A'],[-0.5,true,'Nahe 0 A'],[-4.3,false,'Nicht verfügbar'],[null,true,'Nicht verfügbar']]){data.bat_current=a;data.battery_fresh=fresh;await vm.runInContext('poll()',context);assert.equal(get('h_bat_current').textContent,want);}}
   else if(mode==='disconnected'){assert.equal(get('t_bat_volt').innerHTML,'—');assert.equal(get('dSync').className,'dot bad');}
   else {assert.equal(get('offBanner').style.display,'block');assert.equal(get('dSync').className,'dot bad');}
  }

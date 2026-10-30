@@ -1,0 +1,18 @@
+const fs=require('node:fs'),vm=require('node:vm'),assert=require('node:assert/strict');
+const src=fs.readFileSync('examples/mqtt_ha/web_ui.h','utf8');const script=src.slice(src.indexOf('let autoActive=false'),src.indexOf('let acCanSetPower=false'));
+(async()=>{
+const els={};const get=id=>els[id]??={value:'',checked:false,disabled:false,textContent:'',setCustomValidity(message){this.validationMessage=message;},reportValidity(){},focus(){}};
+let saved={source:'http',boost_enabled:true,boost_min_soc:10,voltage_correction_factor:0,voltage_correction_max_v:2,hard_floor_v:0,cutoff_v:45,resume_delta_v:.5,byd_min_soc:0,wake_min_w:200,wake_delay_s:30,byd_threshold_w:100,data_timeout_s:60,share_pct:80,charge_limit_w:3000,discharge_limit_w:3000,enabled:false};
+let posts=0,finish,fail=false;const c={$:get,toast:()=>{},state:async()=>{},fetch:async()=>({ok:true,json:async()=>saved}),post:async(url,data)=>{++posts;if(fail)throw Error('Flash-Speicherung nicht bestätigt');await new Promise(r=>finish=r);saved={...saved,...data,cutoff_v:data.cutoff_v,source:data.mqtt_source?'mqtt':'http'};}};
+vm.createContext(c);vm.runInContext(script,c);await vm.runInContext('autoPoll()',c);
+get('autoCutV').value='47';get('autoVoltFactor').value='0.00005';get('autoVoltFloor').value='0';get('autoSleepAtCutoff').checked=false;get('autoSettings').oninput();await vm.runInContext('autoPoll()',c);assert.equal(get('autoCutV').value,'47');
+await get('autoSettings').onsubmit({preventDefault(){}});assert.equal(posts,0);assert(get('autoVoltageError').textContent.includes('Untergrenze'));assert(get('autoSaveStatus').textContent.includes('Nicht gespeichert'));assert.equal(get('autoCutV').value,'47');
+get('autoVoltFloor').value='46';get('autoSettings').oninput();assert.equal(get('autoVoltFloor').validationMessage,'');
+const saving=get('autoSettings').onsubmit({preventDefault(){}});assert.equal(posts,1);await vm.runInContext('autoPoll()',c);assert.equal(get('autoLimitSave').disabled,true);await get('autoSettings').onsubmit({preventDefault(){}});assert.equal(posts,1);finish();await saving;
+assert.equal(saved.cutoff_v,47);assert.equal(saved.voltage_correction_factor,.00005);assert.equal(saved.hard_floor_v,46);assert(get('autoSaveStatus').textContent.includes('dauerhaft'));assert.equal(get('autoLimitSave').disabled,false);
+fail=true;get('autoCutV').value='46.9';get('autoSettings').oninput();await get('autoSettings').onsubmit({preventDefault(){}});assert.equal(get('autoCutV').value,'46.9');assert(get('autoSaveStatus').textContent.includes('nicht bestätigt'));assert(!get('autoSaveStatus').textContent.startsWith('Gespeichert'));assert.equal(get('autoLimitSave').disabled,false);
+saved={...saved,cutoff_v:47.09999847,resume_delta_v:.100000001,voltage_correction_factor:.0000499999,voltage_correction_max_v:1.200000047,hard_floor_v:46.7999992};vm.runInContext('autoConfigLoaded=false',c);await vm.runInContext('autoPoll()',c);assert.equal(get('autoCutV').value,47.1);assert.equal(get('autoDeltaV').value,.1);assert.equal(get('autoVoltFactor').value,.00005);assert.equal(get('autoVoltCap').value,1.2);assert.equal(get('autoVoltFloor').value,46.8);
+const postCode=src.slice(src.indexOf('async function post('),src.indexOf('function syncSoc()'));
+const transport={URLSearchParams,location:{replace(){}},fetch:async()=>({ok:true,status:200,json:async()=>{throw Error('HTML');}})};vm.createContext(transport);vm.runInContext(postCode,transport);await assert.rejects(vm.runInContext("post('/test',{})",transport),/gültige Bestätigung/);
+console.log('Auto save: exact screenshot rejection, edited values survive polls, retry, pending lock and persistence error feedback OK');
+})().catch(e=>{console.error(e);process.exitCode=1});

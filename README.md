@@ -1110,3 +1110,240 @@ State ergänzt `auto_sleep_at_cutoff`, `auto_low_voltage_lock`, `auto_sleeping`,
 
 Protokollgrenzen: https://www.victronenergy.com/media/pg/MultiPlus-II_230V/en/operation.html
 Firmware- und UI-Tests ersetzen keinen Test des Abschalt-/Wiederanlaufzyklus am Gerät.
+
+
+### evcc-Messabruf und Diagnose
+
+Die Automatik fragt weiterhin die lokale evcc-API auf 192.168.178.2:7070 ab,
+projiziert aber über den dokumentierten `jq`-Parameter nur Netzleistung,
+Hausverbrauch, PV-Leistung, Batterie-Geräte und Ladepunkt-Leistung. Dadurch
+werden große Forecast-Arrays nicht mehr an den ESP32 übertragen. Die Abfrage
+normalisiert sowohl das direkte State-Objekt als auch eine `result`-Hülle.
+Dokumentation: https://docs.evcc.io/en/reference/state/
+
+Der TCP-Leser puffert maximal 1024 Byte, hält nicht die ganze Antwort im RAM
+und begrenzt den Body auf 512 KiB bzw. die Lesezeit auf 15 Sekunden. Die
+HTTP-Wartezeit ist 5 Sekunden. Fehlende/ungültige Messwerte bleiben gesperrt,
+und der Snapshot-Zeitstempel bezeichnet den Beginn des Abrufs.
+
+`/api/auto` und die Automatik-UI zeigen `fetch_status`, `fetch_http`,
+`fetch_bytes` und `fetch_ms`; die API ergänzt `last_attempt_age_s` und
+`sample_available`. Ein fehlgeschlagener Abruf überschreibt weiterhin nicht
+den letzten vollständigen Messsatz. Die Anzeige funktioniert auch bei
+ausgeschalteter Automatik; das Lesen startet keine Leistungsregelung.
+
+Der native Test `tests/evcc_reader.cpp` verwendet denselben Leser, Filter
+und Schema-Decoder wie die Firmware. Geprüft werden fragmentierte Streams,
+kompakte und große Antworten, Größen-/Zeitgrenzen und fehlende Pflichtfelder.
+
+
+### Lastabhängige Entladesperre
+
+`voltage_correction_factor` (V/W, 0–0,005, Standard 0) kompensiert den
+Spannungseinbruch während der Entladung. Anders als OpenDTU-OnBattery mit
+AC-Leistung verwendet diese Firmware die frische, gleichzeitig gemessene
+DC-Entladeleistung `max(0, -U * I)` (Ladestrom positiv). Damit werden auch
+Verbraucher am AC-OUT und Umwandlungsverluste berücksichtigt.
+
+`U_korr = U_gemessen + min(P_DC_entladen * Faktor, voltage_correction_max_v)`
+
+Die maximale Korrektur ist auf 0–5 V beschränkt, konfigurierbar größer 0;
+Standard 2 V. Bei Faktor > 0 ist `hard_floor_v` erforderlich: eine vom Nutzer
+festzulegende rohe Untergrenze zwischen 38 V und der normalen Stoppspannung.
+Beim Erreichen dieser Untergrenze sperrt die Software ohne Lastkorrektur.
+Die normale Entladesperre und optionale Geräteabschaltung verwenden dieselbe
+Lastkorrektur. Eine aktive Sperre löst sich erst bei der tatsächlichen
+Spannung oberhalb Stoppspannung plus Hysterese, nicht durch rechnerischen Zuschlag.
+Beim Laden und bei fehlenden frischen Werten gibt es keine Lastkompensation.
+Die bereits vorhandenen Frische-Sperren bleiben bestehen.
+
+Faktor aus gemessenem Spannungseinbruch und DC-Entladeleistung bestimmen,
+nicht aus dem Sollwert. Ein OpenDTU-AC-Faktor ist nicht identisch. Keine
+automatische Aktivierung mit einem geratenen Wert; Faktor 0 bewahrt das
+bisherige Verhalten. VEConfigure-/BMS-Schutz wird nicht verändert.
+
+Die UI zeigt rohe/korrigierte Spannung und DC-Entladeleistung. `/api/auto`
+liefert die drei Einstellungen sowie `battery_voltage_v`,
+`voltage_corrected_v` und `battery_discharge_w` (null bei fehlenden Werten).
+HTTP-/MQTT-State ergänzen `auto_voltage_correction_factor`,
+`auto_voltage_correction_max_v`, `auto_hard_floor_v` und
+`auto_voltage_corrected_v`. Alle Einstellungen werden im NVS gespeichert.
+
+Referenz: https://opendtu-onbattery.net/firmware/configuration/dpl/#load-correction-factor
+
+
+### evcc über MQTT und Batterie-Boost
+
+Unter evcc-Automatik → Datenquelle, Boost & Batterieschutz sind `HTTP` und
+`MQTT` wählbar. Bestehende Installationen bleiben zunächst auf HTTP; die
+MQTT-Quelle verwendet den bereits konfigurierten Broker. Nach Quellenwechsel
+werden Sollwert und Messcache zurückgesetzt. Während MQTT ausgewählt ist,
+pausiert der HTTP-Worker; es gibt keinen stillen HTTP-Fallback.
+
+MQTT-Abonnements lesen gezielt `evcc/status`, `evcc/site/grid/power`,
+`evcc/site/homePower`, `evcc/site/pvPower`,
+`evcc/site/battery/devices/1/power` und `/soc` (BYD),
+`evcc/site/battery/devices/2/power` (Victron), `evcc/loadpoints` sowie
+`evcc/loadpoints/+/chargePower`, `/batteryBoost`, `/batteryBoostLimit`,
+`/connected`, `/mode` und `evcc/site/batteryMode`. Es werden keine evcc-
+Steuerthemen beschrieben. Die Zuordnung bleibt installationsspezifisch.
+
+Nach Verbindung müssen alle Leistungsfelder zweimal eintreffen: Ein Satz
+Retain-Werte allein reicht nicht. Danach müssen die Leistungsfelder innerhalb
+der eingestellten evcc-Datenzeit liegen und höchstens 5 s Empfangsabstand
+haben. Der Snapshot behält den ältesten Feld-Zeitstempel; Lesen aus dem Cache
+macht ihn nicht künstlich frisch. Bis zu 8 Ladepunkte werden berücksichtigt.
+Bei dem hier gemessenen evcc-Intervall von 30 s sollte die Datenzeit mindestens
+35 s, beispielsweise 60 s betragen. Broker-Verlust oder evcc-offline setzt den
+Sollwert bei gewähltem MQTT sofort auf 0 W; Spannungsschutz bleibt unabhängig
+aktiv. Zustands-/Boost-Abonnements werden alle 30 s erneut angefordert, damit
+unverändert gespeicherte Steuerflags ebenfalls aktualisiert werden.
+
+Boost funktioniert mit beiden Quellen. Im HTTP-Projektionsabruf werden die
+Boost-Felder mitgelesen. Ein tatsächlicher Boost-Ladebedarf wird erkannt, wenn
+`batteryBoost=true`, das Fahrzeug verbunden ist, der Ladepunkt im Modus
+`pv`/`smart` mehr als 100 W lädt und evcc-Batteriemodus `normal`/`discharge`
+vorliegt. Dann unterstützt der Victron mit 100 % des tatsächlichen Restbedarfs
+statt dem normalen Prozentanteil, weiterhin begrenzt durch Entladeleistung,
+Spannungsschutz, BYD-Gegenladungssperre und eigene frische SoC-Messung.
+Es wird keine feste Maximalleistung blind ins Netz eingespeist.
+
+`boost_min_soc` ist die **eigene Victron-Boost-Grenze** (0–100 %, Standard 10),
+wie vom Nutzer gewünscht unabhängig von der evcc-BYD-Boost-Grenze. Bei SoC
+kleiner/gleich der Grenze oder fehlenden aktuellen SoC-Werten endet die
+zusätzliche Boost-Unterstützung. Der Boost-Verbrauch wird dann aus dem normalen
+Restbedarf entfernt; die normale Hauslast kann weiter aus dem Victron gedeckt
+werden. Abschalten des Boost-Schalters stellt das bisherige normale Regelverhalten
+wieder her. Eine automatische Mindestspannungs-Abschaltung wird durch Boost
+nicht aufgehoben: Wiederanlauf bleibt an PV-Überschuss gebunden.
+
+NVS und POST `/admin/api/auto/config`: `mqtt_source` (0/1), `boost_enabled`
+(0/1), `boost_min_soc`. GET `/api/auto`: `source`, `boost_enabled`,
+`boost_min_soc`, `boost_requested`, `boost_supporting`, `boost_soc_ready`,
+`victron_soc`. MQTT-/HTTP-State ergänzen `auto_source`, `auto_boost_enabled`,
+`auto_boost_min_soc` und `auto_boost_supporting`.
+
+Referenzen: https://docs.evcc.io/docs/integrations/mqtt-api/
+https://docs.evcc.io/en/features/battery/
+Native/Replay-/UI-Tests prüfen die Software; ein echter Auto-/Batterie-Boost-
+Zyklus oder MQTT-Regelbetrieb auf dem ESP32 wurde dadurch nicht ausgeführt.
+
+
+### Bestätigtes Speichern der Automatik-Einstellungen
+
+Die Automatik-Konfiguration wird als zusammenhängendes Formular validiert.
+Bei Lastkorrekturfaktor > 0 und unkompensierter Untergrenze 0 wird das gesamte
+Formular abgelehnt, also auch eine gleichzeitig geänderte Stoppspannung.
+Die UI zeigt diesen Zusammenhang direkt am Feld und beim Speichern an;
+Eingaben bleiben bei Fehlern erhalten und werden durch Status-Polling nicht
+überschrieben. Während des Speicherns bleiben weitere Speicheraufrufe gesperrt.
+
+Nach `saveConfig()` liest die API alle 17 Automatik-Einstellungen über eine
+neue Preferences-Leseinstanz aus dem NVS und vergleicht sie mit der aktiven
+Konfiguration. Erst bei Übereinstimmung wird Erfolg zurückgegeben. Bei
+Abweichung/fehlendem Schlüssel wird HTTP 503 mit einem Hinweis auf möglicherweise
+nur im RAM aktive Werte geliefert. Das ist keine transaktionale Flash-Schreiboperation;
+Fehler werden erkannt, nicht durch einen erfundenen Erfolg verdeckt.
+Nicht-JSON-Antworten gelten in der UI ebenfalls nicht als Bestätigung.
+
+Geladene Float-Werte werden für die Eingabefelder auf deren Schrittweite gerundet (Spannungen/Hysterese: 0,1 V; Faktor: 0,00001 V/W), damit binäre Rundungsreste wie 47,09999847 nicht zu HTML-Step-Fehlern beim erneuten Speichern führen.
+
+
+### Interner Verlauf: letzte 24 Stunden
+
+Der Verlauf speichert 1440 Minutenmittelwerte für Ausgangsleistung,
+Netzleistung, ESS-Sollwert, Batteriespannung, SoC und Batteriestrom.
+Die CRC-gesicherte Ringdatei `/vebus/history24-v1.bin` benötigt 28.820 Bytes.
+LittleFS verwendet die vorhandene 128-KiB-Datenpartition; OTA- und
+Einstellungspartitionen bleiben unverändert. Die SD-Karte wird nicht angesprochen.
+
+Eine Hintergrundaufgabe speichert fünf Messpunkte gemeinsam (etwa alle fünf
+Minuten). Ein abrupter Neustart kann die noch nicht gespeicherten letzten fünf
+Minuten verlieren. Nach Zeitabgleich werden nur gültige Datensätze der letzten
+24 Stunden wiederhergestellt; Ausfallzeiten bleiben Lücken. CRC erkennt
+beschädigte Datensätze, ersetzt aber keine Hardware-Prüfung auf Stromausfälle.
+
+Die Firmware formatiert nur eine nachweislich vollständig gelöschte Partition
+(alle Bytes 0xff). Ein unbekanntes vorhandenes Dateisystem wird nicht gelöscht;
+der Verlauf läuft dann im RAM weiter. `/api/history` meldet Speicherstatus,
+Dateisystemgröße und Belegung, Fehler und letzten Speicherzeitpunkt.
+
+Diese Datei speichert den Diagrammverlauf. Tagesstatistiken verbleiben in NVS;
+Kapazitätstest-CSV-Dateien werden dadurch nicht dauerhaft gespeichert.
+
+# Wechselrichterfreigabe bei automatischer Entladung
+
+Bei Beginn eines freigegebenen Entladebedarfs setzt die Automatik den Sollwert
+zunächst auf 0 W und fordert über den vorhandenen VE.Bus-Schaltbefehl die
+Betriebsart **Ein** an (Ladegerät und Wechselrichter). Erst wenn beide
+Freigabebits zurückgemeldet werden, wird normal hochgeregelt. Ein bereits
+abgeschaltetes Gerät wird durch diesen Pfad nicht eingeschaltet; die bestehende
+PV-Wiederanlaufsteuerung nach Unterspannung bleibt getrennt. Manuelle
+Betriebsartbefehle deaktivieren weiterhin die Automatik.
+
+Bei mindestens 200 W angeforderter Entladung und weniger als 50 W gemessener
+AC-Einspeisung sowie DC-Entladung fordert die Automatik nach 30 Sekunden
+0 W und Ein erneut an. Dies gilt auch, wenn die aktive Betriebsart noch nicht
+beide Freigaben enthält. Maximal drei Wiederholversuche mit mindestens 60
+Sekunden Abstand. Frische lokale und externe Werte, DC-Freigabe und keine
+Spannungssperre sind erforderlich. Inverter-only wird nicht geschaltet. ESS-Assistenten-Sperrbits werden nicht überschrieben.
+
+`/api/auto` meldet `ess_recovery_attempts` und `ess_recovery_exhausted`.
+Der effektive ESS-Sollwert bleibt eine angeforderte Leistung, keine
+Empfangs- oder Leistungsbestätigung des MultiPlus. Die Wirkung des neuen
+ON-Ablaufs muss nach Installation am Gerät geprüft werden.
+
+## Automatischer Menü-Aus-/Ein-Zyklus mit Tageslimit
+
+Wenn trotz mindestens 200 W Sollwert 120 Sekunden lang weniger als 50 W AC-
+und DC-Entladung gemessen werden, kann die Automatik maximal zweimal pro Kalendertag (Europe/Berlin)
+Aus und Ein anfordern, mit mindestens 30 Minuten Abstand zwischen den Versuchen.
+Tagesdatum, Zähler und letzter Versuchszeitpunkt werden gemeinsam in NVS
+reserviert und zurückgelesen, bevor Aus angefordert wird. Abgebrochene Versuche
+zählen mit. Neustarts des LILYGO oder Ein-/Ausschalten der Automatik setzen
+weder den Zähler noch den Abstand zurück. Der Abstand gilt auch über Mitternacht.
+Ohne gültige Uhrzeit, bei zurückspringender Zeit oder fehlerhaftem Speicher
+wird kein neuer Zyklus gestartet. Ein neuer Tag wird erst mit gültiger,
+vorwärts laufender Uhrzeit anerkannt.
+
+Voraussetzungen: Betriebsart zuvor Ein, aktuelle lokale/evcc-Messwerte,
+konfigurierte Spannungssperre (>0), gemessene Spannung mindestens Abschaltgrenze
+plus Wiederfreigabeabstand, keine eigene Spannungssperre und keine Überlast-,
+Temperatur- oder Low-Battery-LED. Das fehlende DC-Freigabebit ist bei diesem
+gezielt autorisierten Wiederanlauf kein Ausschlussgrund; es wird weder
+überschrieben noch als vorhanden ausgegeben.
+
+Der Ablauf hält den Sollwert auf 0 W, fordert Aus an, wartet maximal 20 s auf
+Rückmeldung, wartet danach 10 s und fordert Ein an. Anschließend müssen innerhalb
+20 s beide Betriebsart-Freigaben und nach dem Ein-Befehl erfasste AC-/Batteriewerte
+vorliegen. Während der Aus-Pause sind höchstens 30 s alte Batterie-/Spannungswerte
+zulässig; nach Ein gilt wieder die normale Frischegrenze von 10 s. Alte externe
+Daten, weggefallener Entladebedarf oder Alarme brechen ab. Ist Ein schon
+angefordert, wird bei automatischem Abbruch wieder Aus angefordert. Manuelle
+Betriebsartbefehle stoppen die Automatik und heben die geplante Ein-Anforderung
+auf. Nach Abbruch ist gegebenenfalls eine manuelle Einschaltung erforderlich.
+
+AC-OUT kann dabei unterbrochen werden. Dies ist der Menü-Schaltvorgang, kein
+vollständiger Strom-/Elektronik-Neustart. Interne Schutzbedingungen bleiben
+wirksam. API `/api/auto`: `restart_used`, `restart_active`, `restart_status`, `restart_today`,
+`restart_daily_limit`, `restart_day`, `restart_cooldown_s`, `restart_clock_valid`,
+`restart_storage_ok` und `restart_limit_status`.
+Status und Ergebnis erscheinen unter den Live-Messwerten. Hardwarewirkung
+muss nach Installation geprüft werden.
+
+### Reparatur des Verlaufsformats und letzte Diagrammwerte
+
+Beim Anlegen der Verlaufsdatei wird die Kopf-Länge explizit verwendet; gepufferte
+Schreibzugriffe werden nicht über eine möglicherweise veraltete Dateigröße
+positioniert. Vor der Aufzeichnung wird der persistierte Kopf erneut gelesen.
+Eine ungültige eigene Ringdatei wird unter `history24-bad-1.bin` bis
+`history24-bad-3.bin` gesichert, ohne bestehende Backups zu überschreiben.
+CRC-gültige Datensätze aus dem letzten 24-h-Fenster können in den neuen Ring
+übernommen werden. Bei fehlendem Platz oder drei bestehenden Backups bleibt
+die Reparatur gesperrt. Ein unbekanntes Dateisystem wird nicht formatiert.
+`/api/history` meldet die Zahl geretteter Datensätze als `storage.recovered`.
+
+Unter jedem Diagramm stehen die letzten gültigen Minutenmittelwerte und deren
+Zeitpunkt. Die Werte sind unabhängig vom gewählten Diagramm-Zoom; ältere Daten
+außerhalb des 24-h-Fensters werden nicht als letzte Messung angezeigt. Fehlende
+Einzelfelder bleiben „—“, Nullwerte bleiben echte Nullwerte.

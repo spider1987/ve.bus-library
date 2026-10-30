@@ -16,6 +16,7 @@ const script = s.slice(
     const els = {};
     const get = (id) => (els[id] ??= { disabled: false, textContent: "" });
     const a = {
+      fetch_status: "IncompleteInput",fetch_http:200,fetch_bytes:230,fetch_ms:25,
       share_pct: 90,
       charge_limit_w: 3000,
       discharge_limit_w: 3000,
@@ -48,6 +49,8 @@ const script = s.slice(
     assert.equal(get("autoOff").disabled, !enabled || ro);
     assert.equal(get("autoDemand").textContent, fresh ? "2.000 W" : "—");
     assert(get("autoStatus").textContent.includes("1.800 W"));
+    assert(get("autoFetchStatus").textContent.includes("IncompleteInput"));
+    assert(get("autoFetchStatus").textContent.includes("HTTP 200"));
   }
   console.log("Auto UI modes, stale values and manual control locking OK");
 })().catch((e) => {

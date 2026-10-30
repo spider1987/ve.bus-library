@@ -89,8 +89,8 @@ constexpr int chargePriority(int wanted, unsigned minimum, bool valid, float soc
 }
 constexpr bool wakeReady(bool enabled, bool complete, uint32_t age, bool solarValid,
                          int demand, int solarResidual, int other, int tolerance,
-                         unsigned minimumSoc, bool socValid, float soc, int minimumW, int chargeLimit) {
-    return enabled && complete && age<=7500 && solarValid && chargeLimit>=minimumW &&
+                         unsigned minimumSoc, bool socValid, float soc, int minimumW, int chargeLimit, uint32_t maximumAge=7500) {
+    return enabled && complete && age<=maximumAge && solarValid && chargeLimit>=minimumW &&
         demand<=-(minimumW+CHARGE_RESERVE) && solarResidual<=-(minimumW+CHARGE_RESERVE) &&
         other<=tolerance && priorityReady(minimumSoc,socValid,soc);
 }
@@ -129,4 +129,40 @@ static_assert(!timerStart.after(false,32000).tracking,"missing data resets wake 
 constexpr SurplusTimer timerRestart=timerStart.after(false,32000).after(true,33000);
 static_assert(!timerRestart.stable(62000,30)&&timerRestart.stable(63000,30),"restart full delay after a gap");
 static_assert(SurplusTimer(true,0xfffff000UL).stable(25904,30),"wake timer survives millis wrap");
+}
+
+namespace AutoPower {
+constexpr float dischargeWatts(float volts,float amps) {return volts>0&&amps<0?-volts*amps:0;}
+constexpr float voltageCorrection(float volts,float amps,float factor,float cap) {
+    return factor<=0||cap<=0?0:dischargeWatts(volts,amps)*factor>cap?cap:dischargeWatts(volts,amps)*factor;
+}
+constexpr float correctedVoltage(float volts,float amps,float factor,float cap) {return volts+voltageCorrection(volts,amps,factor,cap);}
+constexpr bool voltageStop(float volts,float amps,float cutoff,float factor,float cap,float hardFloor) {
+    return cutoff>0 && ((hardFloor>0&&volts<=hardFloor)||correctedVoltage(volts,amps,factor,cap)<=cutoff);
+}
+constexpr bool compensatedLatch(bool latched,float volts,float amps,float cutoff,float delta,float factor,float cap,float floor) {
+    return cutoff<=0?false:voltageStop(volts,amps,cutoff,factor,cap,floor)?true:latched&&volts<cutoff+delta;
+}
+static_assert(correctedVoltage(48,-100,.0002f,2)>48.95f&&correctedVoltage(48,-100,.0002f,2)<48.97f,"100 A uses actual DC power");
+static_assert(!voltageStop(47.5f,-100,48,.0002f,2,46),"load sag alone does not stop");
+static_assert(voltageStop(45,-100,48,.005f,5,46),"hard raw floor always wins");
+static_assert(voltageCorrection(48,100,.001f,2)==0,"charging never lifts guard voltage");
+static_assert(voltageCorrection(48,-100,.005f,2)==2,"maximum correction enforced");
+static_assert(voltageStop(47.5f,-100,48,0,2,0),"zero factor keeps legacy behavior");
+static_assert(compensatedLatch(true,48,-100,48,.5f,.001f,2,46),"correction cannot release a latched guard");
+static_assert(!compensatedLatch(true,48.5f,0,48,.5f,.001f,2,46),"raw recovery releases latch");
+}
+
+namespace AutoPower {
+constexpr bool boostReady(bool enabled,bool requested,bool fresh,float soc,unsigned minimum) {
+    return enabled&&requested&&fresh&&soc>=0&&soc<=100&&soc>minimum;
+}
+constexpr int boostDemand(int demand,int evBoostW,bool requested,bool enabled,bool ready) {
+    return requested&&enabled&&!ready?demand-evBoostW:demand;
+}
+static_assert(boostReady(true,true,true,51,50),"separate boost SoC permits support");
+static_assert(!boostReady(true,true,true,50,50),"stop at own boost floor");
+static_assert(!boostReady(true,true,false,80,10),"missing SoC forbids boost");
+static_assert(boostDemand(6500,6000,true,true,false)==500,"below boost floor only household remains");
+static_assert(boostDemand(6500,6000,true,true,true)==6500,"boost supports real demand, never a fixed export");
 }

@@ -384,6 +384,7 @@ public:
     float   getMaxInputCurrentLimit() const { return _masterMultiLED_MaximumInputCurrentLimit; }
     float   getActInputCurrentLimit() const { return _masterMultiLED_ActualInputCurrentLimit; }
     byte    getSwitchRegister() const { return _masterMultiLED_SwitchRegister; }
+    uint32_t getSwitchUpdateMs() const { return _switchUpdateMs; }
 
     // --- From readRAMVars() response ---
     bool    hasRAMVarResponse()  const { return _gotRAMVars; }
@@ -505,6 +506,7 @@ private:
     volatile float   _masterMultiLED_MaximumInputCurrentLimit;
     volatile float   _masterMultiLED_ActualInputCurrentLimit;
     volatile byte    _masterMultiLED_SwitchRegister;
+    volatile uint32_t _switchUpdateMs=0;
 
     // Legacy RAM read response (requestReadRAM)
     volatile float   _BatVolt;

@@ -673,6 +673,7 @@ void VEBus::_decodeFrame(const char *frame, int len)
             t = 256 * (uint8_t)frame[15] + (uint8_t)frame[14];
             _masterMultiLED_ActualInputCurrentLimit  = (float)t / 10.0f;
             _masterMultiLED_SwitchRegister = (byte)frame[16];
+            _switchUpdateMs = millis();
         }
         break;
 

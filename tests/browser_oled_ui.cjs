@@ -318,7 +318,7 @@ const pause = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
           }
         }
         if (route === "/") {
-          assert.equal(v.tiles, 8);
+          assert.equal(v.tiles, 6);
           assert(v.blackTiles);
           assert.equal(v.cardBg, "rgb(0, 0, 0)");
         }

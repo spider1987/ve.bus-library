@@ -38,6 +38,14 @@
 #include "BatteryEnergy.h"
 #include "StatusLed.h"
 #include "AutoPower.h"
+#include "EssRecovery.h"
+#include "EssRestart.h"
+#include "RestartBudget.h"
+#include "EvccReader.h"
+#include "EvccState.h"
+#include "EvccMqtt.h"
+#include "History48.h"
+#include "FlashHistory.h"
 #include "EnergyBook.h"
 #include "WiFiRecovery.h"
 #include <sys/time.h>
@@ -110,8 +118,6 @@ static void showStatusLed(LedStatus state, uint32_t now) {
 
 // History (for the dashboard charts): one averaged sample per minute, 24 h
 #define HIST_INTERVAL_MS    60000UL
-#define HIST_LEN             1440
-#define HIST_GAP            INT16_MIN
 
 // =======================================================================
 // Globals
@@ -157,7 +163,8 @@ VEBusUpsData &live = ups.data;
 static AcEnergy acEnergy;
 static BatteryEnergy batEnergy;
 static bool batHaveSample = false;
-static uint32_t batSampleMs = 0;
+static uint32_t batSampleMs = 0, socSampleMs=0;
+static bool socHaveSample=false;
 static float batSampleV = 0, batSampleA = 0;
 static bool acRunning = false, acStarted = false, acInvert = false;
 static bool acHaveMains = false;
@@ -204,7 +211,7 @@ bool     g_otaAuthed      = false;
 bool     g_essDirty       = false;   // ESS setpoint / virtual mode not yet in NVS
 uint32_t g_essSavedMs     = 0;
 
-struct AutoSettings { uint16_t chargeW=3000, dischargeW=3000; bool sleepAtCutoff=false; uint8_t bydMinSoc=0; uint16_t wakeMinW=200, wakeDelayS=30; uint8_t sharePct=90; uint16_t bydThresholdW=100, dataTimeoutS=35; float cutoffV=0, resumeDeltaV=1; } autoCfg;
+struct AutoSettings { bool useMqtt=false,boostEnabled=true;uint8_t boostMinSoc=10; uint16_t chargeW=3000, dischargeW=3000; bool sleepAtCutoff=false; uint8_t bydMinSoc=0; uint16_t wakeMinW=200, wakeDelayS=30; uint8_t sharePct=90; uint16_t bydThresholdW=100, dataTimeoutS=35; float correctionFactor=0, correctionMaxV=2, hardFloorV=0; float cutoffV=0, resumeDeltaV=1; } autoCfg;
 static bool autoLowLock=false, autoSleeping=false;
 static uint32_t autoSwitchMs=0, autoWakeMs=0;
 static AutoPower::SurplusTimer autoSurplusTimer;
@@ -217,7 +224,7 @@ static bool voltageBlocked = false;
 static bool dischargeBlocked() { return autoLowLock || (autoCfg.cutoffV>0 && (voltageBlocked || !batFresh(millis()))); }
 static void updateVoltageGuard() {
     if (autoCfg.cutoffV<=0) voltageBlocked=false;
-    else if(batFresh(millis())) voltageBlocked=AutoPower::voltageLatch(voltageBlocked,batSampleV,autoCfg.cutoffV,autoCfg.resumeDeltaV);
+    else if(batFresh(millis())) voltageBlocked=AutoPower::compensatedLatch(voltageBlocked,batSampleV,batSampleA,autoCfg.cutoffV,autoCfg.resumeDeltaV,autoCfg.correctionFactor,autoCfg.correctionMaxV,autoCfg.hardFloorV);
     if(dischargeBlocked() && (g_essPower>0 || vebus.getEffectiveESSPower()>0)) {
         g_essPower=0;vebus.enableVirtualSetpointMode(false);vebus.setESSPower(0);g_publishNow=true;
     }
@@ -291,72 +298,89 @@ static const EnergyDay *yesterdayEnergy() {
 }
 
 // evcc snapshots are read on a separate task: HTTP never blocks VE.Bus/UI.
-struct AutoSnapshot { bool valid, solarValid, bydSocValid; float bydSoc; uint32_t atMs; int gridW, otherW, victronW, demandW, solarResidualW; };
+struct AutoSnapshot { bool boostActive=false;float boostLimitSoc=0;int boostChargeW=0; const char *fetchError; int httpStatus; uint32_t bytesRead, durationMs; bool valid, solarValid, bydSocValid; float bydSoc; uint32_t atMs; int gridW, otherW, victronW, demandW, solarResidualW; };
 static QueueHandle_t autoQueue = nullptr;
 static bool autoEnabled = false, autoHaveSample = false;
-static AutoSnapshot autoSample = {};
+static AutoSnapshot autoSample = {}, autoLastAttempt = {};
+static bool autoReceivedAttempt=false,autoBoostEffective=false;
+static EvccMqtt evccMqtt;
+static volatile bool workerUseMqtt=false;
+static uint32_t mqttEvccEmitMs=0;
+static bool victronSocFresh(uint32_t now){return socHaveSample&&batFresh(now)&&now-socSampleMs<=10000&&isfinite(live.soc)&&live.soc>=0&&live.soc<=100;}
+static uint32_t autoFreshWindow(){return autoCfg.useMqtt?autoCfg.dataTimeoutS*1000UL:15000UL;}
+static void subscribeEvcc(bool onlyFlags=false) {
+    const char *powerTopics[]={"evcc/site/grid/power","evcc/site/homePower","evcc/site/pvPower","evcc/site/battery/devices/1/power","evcc/site/battery/devices/2/power","evcc/site/battery/devices/1/soc","evcc/loadpoints","evcc/loadpoints/+/chargePower"};
+    const char *flagTopics[]={"evcc/status","evcc/site/batteryMode","evcc/loadpoints/+/batteryBoost","evcc/loadpoints/+/batteryBoostLimit","evcc/loadpoints/+/connected","evcc/loadpoints/+/mode"};
+    if(!onlyFlags)for(auto t:powerTopics)mqtt.subscribe(t);
+    for(auto t:flagTopics)mqtt.subscribe(t);
+}
 static const char *autoReason = "Aus";
 static int autoWanted = 0;
-static const char *AUTO_URL = "http://192.168.178.2:7070/api/state";
+// Official evcc jq projection: forecasts never need to cross the ESP32 TCP stream.
+static const char *AUTO_URL = "http://192.168.178.2:7070/api/state?jq=%28.result%20%2F%2F%20.%29%20%7C%20%7Bgrid%3A%20%7Bpower%3A%20.grid.power%7D%2C%20homePower%3A%20.homePower%2C%20pvPower%3A%20.pvPower%2C%20batteryMode%3A%20.batteryMode%2C%20battery%3A%20%7Bdevices%3A%20.battery.devices%7D%2C%20loadpoints%3A%20%5B.loadpoints%5B%5D%20%7C%20%7BchargePower%3A%20.chargePower%2C%20batteryBoost%3A%20.batteryBoost%2C%20batteryBoostLimit%3A%20.batteryBoostLimit%2C%20connected%3A%20.connected%2C%20mode%3A%20.mode%7D%5D%7D";
 
 static void autoWorker(void *) {
     for (;;) {
+        if(workerUseMqtt){vTaskDelay(pdMS_TO_TICKS(1000));continue;}
         AutoSnapshot snap = {};
+        const uint32_t started=millis();
+        snap.fetchError="WLAN nicht verbunden";
         if (WiFi.status() == WL_CONNECTED) {
             WiFiClient client;
             HTTPClient http;
             http.useHTTP10(true);
             http.setConnectTimeout(1500);
-            http.setTimeout(2000);
+            http.setTimeout(5000);
+            snap.fetchError="HTTP-Verbindung konnte nicht gestartet werden";
             if (http.begin(client, AUTO_URL)) {
-                if (http.GET() == 200 && http.getSize() <= 65536) {
-                    StaticJsonDocument<512> filter;
-                    filter["grid"]["power"] = true;
-                    filter["homePower"] = true; filter["pvPower"] = true;
-                    filter["loadpoints"][0]["chargePower"] = true;
-                    filter["battery"]["devices"][0]["power"] = true;
-                    filter["battery"]["devices"][0]["soc"] = true;
+                http.addHeader("Accept-Encoding","identity");
+                snap.httpStatus=http.GET();snap.fetchError="HTTP-Fehler";
+                if (snap.httpStatus == 200 && http.getSize() > (int)EvccReader<WiFiClient>::MAX_BYTES) snap.fetchError="evcc-Antwort über 512 KiB";
+                if (snap.httpStatus == 200 && http.getSize() <= (int)EvccReader<WiFiClient>::MAX_BYTES) {
+                    StaticJsonDocument<1024> filter;
+                    configureEvccFilter(filter);
                     DynamicJsonDocument doc(4096);
-                    const DeserializationError err = deserializeJson(doc, http.getStream(), DeserializationOption::Filter(filter));
-                    JsonArray devices = doc["battery"]["devices"].as<JsonArray>();
-                    // Verified installation: device 1 = GoodWe/BYD, device 2 = LilyGo.
-                    if (!err && devices.size() == 2 && doc["grid"]["power"].is<float>() &&
-                        devices[0]["power"].is<float>() && devices[1]["power"].is<float>()) {
-                        const float grid = doc["grid"]["power"], other = devices[0]["power"], vic = devices[1]["power"];
-                        if (isfinite(grid) && isfinite(other) && isfinite(vic) &&
-                            fabsf(grid) < 100000 && fabsf(other) < 100000 && fabsf(vic) < 100000) {
-                            snap.gridW = lroundf(grid); snap.otherW = lroundf(other); snap.victronW = lroundf(vic);
-                            // Grid + all batteries = consumption minus PV (includes EV loads).
-                            snap.demandW = snap.gridW + snap.otherW + snap.victronW;
-                            snap.valid = true;
-                            if(devices[0]["soc"].is<float>()) {
-                                const float soc=devices[0]["soc"];
-                                snap.bydSocValid=isfinite(soc)&&soc>=0&&soc<=100;
-                                if(snap.bydSocValid)snap.bydSoc=soc;
-                            }
-                            // Explicit solar gate: include EV consumption, never substitute missing values.
-                            if(doc["homePower"].is<float>() && doc["pvPower"].is<float>() && doc["loadpoints"].is<JsonArray>()) {
-                                float home=doc["homePower"], pv=doc["pvPower"], ev=0;
-                                bool ok=isfinite(home) && isfinite(pv) && home>=0 && pv>=0 && home<100000 && pv<100000;
-                                for(JsonObject lp: doc["loadpoints"].as<JsonArray>()) {
-                                    if(!lp["chargePower"].is<float>()){ok=false;break;}
-                                    float w=lp["chargePower"]; if(!isfinite(w) || w<0 || w>=100000){ok=false;break;} ev+=w;
-                                }
-                                snap.solarValid=ok && ev<100000;
-                                if(snap.solarValid)snap.solarResidualW=lroundf(home+ev-pv);
-                            }
-                        }
-                    }
+                    EvccReader<WiFiClient> input(http.getStream(),[]()->uint32_t{return millis();});
+                    const DeserializationError err = deserializeJson(doc, input, DeserializationOption::Filter(filter));
+                    snap.bytesRead=input.bytes;
+                    snap.fetchError=input.tooLarge?"evcc-Antwort über 512 KiB":input.timedOut?"evcc-Lesezeit über 15 s":filter.overflowed()?"JSON-Filter zu klein":err?err.c_str():"Leistungsfelder fehlen / Batteriezuordnung prüfen";
+                    if(!err && !input.tooLarge && !input.timedOut && !filter.overflowed())decodeEvcc(doc.as<JsonVariantConst>(),snap);
                 }
                 http.end();
             }
         }
-        snap.atMs = millis();
+        snap.atMs = started;snap.durationMs=millis()-started;
         xQueueOverwrite(autoQueue, &snap);
         vTaskDelay(pdMS_TO_TICKS(5000));
     }
 }
 
+static EssRecovery essRecovery;
+static EssRestart essRestart;
+static RestartBudget restartBudget;
+static bool restartBudgetStorageOk=true;
+static void loadRestartBudget(){
+    Preferences store;
+    if(!store.begin("vebus_mqtt",true)){restartBudgetStorageOk=false;return;}
+    if(store.isKey("restartday")){
+        const size_t n=store.getBytesLength("restartday");
+        restartBudgetStorageOk=n==sizeof(RestartBudget::Record)&&
+            store.getBytes("restartday",&restartBudget.record,sizeof(restartBudget.record))==sizeof(restartBudget.record)&&
+            RestartBudget::valid(restartBudget.record);
+    }
+    store.end();
+}
+static bool reserveRestartBudget(uint32_t day,uint32_t epoch){
+    if(!restartBudgetStorageOk||!restartBudget.reserve(day,epoch))return false;
+    Preferences store;RestartBudget::Record check;
+    if(!store.begin("vebus_mqtt",false)){restartBudgetStorageOk=false;return false;}
+    restartBudgetStorageOk=store.putBytes("restartday",&restartBudget.record,sizeof(restartBudget.record))==sizeof(restartBudget.record);
+    store.end();
+    if(!store.begin("vebus_mqtt",true)){restartBudgetStorageOk=false;return false;}
+    restartBudgetStorageOk=restartBudgetStorageOk&&store.getBytes("restartday",&check,sizeof(check))==sizeof(check)&&
+        check.day==restartBudget.record.day&&check.count==restartBudget.record.count&&check.lastEpoch==restartBudget.record.lastEpoch;
+    store.end();return restartBudgetStorageOk;
+}
 static void autoSetPower(int watts) {
     g_essPower = (int16_t)AutoPower::bounded(watts,autoCfg.chargeW,autoCfg.dischargeW);
     g_lastEssCmdMs = millis();
@@ -364,7 +388,9 @@ static void autoSetPower(int watts) {
     g_publishNow = true;
 }
 static void autoStop() {
-    autoEnabled = false; autoWanted = 0; autoReason = "Aus · Sollwert 0 W";
+    essRestart.cancel();
+    essRecovery.reset();
+    autoEnabled = false; autoBoostEffective=false; autoWanted = 0; autoReason = "Aus · Sollwert 0 W";
     autoSetPower(0);
 }
 // Only an automatic low-voltage shutdown is automatically reversed.
@@ -375,24 +401,73 @@ static void autoSleep(uint32_t now) {
     vebus.setSwitchState(VEBUS_SWITCH_STATE_OFF);
     autoReason="Mindestspannungs-Abschaltung angefordert · warte auf PV und BYD-Freigabe";
 }
+static bool essRestartSafe(uint32_t now,bool duringOff){
+    const bool external=autoHaveSample&&autoSample.valid&&autoSample.solarValid&&
+        now-autoSample.atMs<=autoFreshWindow()&&(!autoCfg.useMqtt||(mqtt.connected()&&evccMqtt.online));
+    const bool voltage=batHaveSample&&!vebus.hasNoSync()&&now-batSampleMs<=(duringOff?30000UL:10000UL)&&
+        isfinite(batSampleV)&&autoCfg.cutoffV>0&&batSampleV>=autoCfg.cutoffV+autoCfg.resumeDeltaV&&
+        (!autoCfg.hardFloorV||batSampleV>autoCfg.hardFloorV);
+    const unsigned alarms=VEBUS_LED_OVERLOAD|VEBUS_LED_LOW_BATTERY|VEBUS_LED_TEMPERATURE;
+    const bool modeFresh=vebus.getSwitchUpdateMs()&&now-vebus.getSwitchUpdateMs()<=10000;
+    const bool boost=AutoPower::boostReady(autoCfg.boostEnabled,autoSample.boostActive,victronSocFresh(now),live.soc,autoCfg.boostMinSoc);
+    const int demand=AutoPower::boostDemand(autoSample.demandW,autoSample.boostChargeW,autoSample.boostActive,autoCfg.boostEnabled,boost);
+    const int target=AutoPower::target(demand,autoSample.otherW,autoCfg.chargeW,autoCfg.dischargeW,boost?100:autoCfg.sharePct,autoCfg.bydThresholdW);
+    return autoEnabled&&external&&voltage&&modeFresh&&vebus.isTxEnabled()&&
+        !autoLowLock&&!autoSleeping&&!voltageBlocked&&
+        !((vebus.getLEDon()|vebus.getLEDblink())&alarms)&&target>=200;
+}
 static void autoLoop(uint32_t now) {
     AutoSnapshot next;
-    const bool updated=autoQueue && xQueueReceive(autoQueue,&next,0)==pdTRUE;
-    const bool complete=updated && next.valid && next.solarValid;
+    bool updated=autoQueue && xQueueReceive(autoQueue,&next,0)==pdTRUE;
+    if(autoCfg.useMqtt){
+        updated=false;
+        if(!mqttEvccEmitMs||now-mqttEvccEmitMs>=5000){
+            next=AutoSnapshot{};
+            if(mqtt.connected())evccMqtt.snapshot(next,now,autoCfg.dataTimeoutS);else next.fetchError="MQTT-Verbindung unterbrochen";
+            if(!next.valid)next.atMs=now;
+            mqttEvccEmitMs=now;updated=true;
+        }
+    }
+    if(updated){autoLastAttempt=next;autoReceivedAttempt=true;}
+    const bool complete=updated && next.valid && next.solarValid && now-next.atMs<=autoFreshWindow();
     if(complete){autoSample=next;autoHaveSample=true;}
-    if(!autoEnabled)return;
+    if(!autoEnabled){autoBoostEffective=false;return;}
+    if(essRestart.active()){
+        const uint8_t mode=vebus.getSwitchRegister()&(VEBUS_SWITCH_CHARGE|VEBUS_SWITCH_INVERT);
+        const bool freshMode=(int32_t)(vebus.getSwitchUpdateMs()-essRestart.phaseMs)>0;
+        const bool samples=acFresh(now)&&batFresh(now)&&(int32_t)(acMainsMs-essRestart.onMs)>0&&(int32_t)(batSampleMs-essRestart.onMs)>0;
+        const auto action=essRestart.advance(now,essRestartSafe(now,essRestart.phase!=EssRestart::WaitOn),freshMode&&mode==0,
+            freshMode&&mode==(VEBUS_SWITCH_CHARGE|VEBUS_SWITCH_INVERT),samples);
+        autoWanted=0;if(g_essPower)autoSetPower(0);g_lastEssCmdMs=now;
+        if(action==EssRestart::SendOn){vebus.enableVirtualSetpointMode(false);vebus.setSwitchState(VEBUS_SWITCH_STATE_ON);}
+        if(action==EssRestart::SendOff)vebus.setSwitchState(VEBUS_SWITCH_STATE_OFF);
+        autoReason=essRestart.status();
+        return;
+    }
     // Fresh voltage, not a stale/no-data guard, may trigger a device shutdown.
     if(autoCfg.sleepAtCutoff && autoCfg.cutoffV>0 && !autoLowLock && batFresh(now) &&
-       batSampleV<=autoCfg.cutoffV && (vebus.getSwitchRegister()&(VEBUS_SWITCH_CHARGE|VEBUS_SWITCH_INVERT)) && vebus.isTxEnabled()) { autoSleep(now);return; }
+       AutoPower::voltageStop(batSampleV,batSampleA,autoCfg.cutoffV,autoCfg.correctionFactor,autoCfg.correctionMaxV,autoCfg.hardFloorV) && (vebus.getSwitchRegister()&(VEBUS_SWITCH_CHARGE|VEBUS_SWITCH_INVERT)) && vebus.isTxEnabled()) { autoSleep(now);return; }
+    if(autoCfg.useMqtt && (!mqtt.connected()||!evccMqtt.online)){
+        autoBoostEffective=false;autoWanted=0;if(g_essPower)autoSetPower(0);
+        autoSurplusTimer.reset();
+        if(autoLowLock&&vebus.isTxEnabled()){
+            if(!autoSleeping)autoSleep(now);
+            else if(now-autoSwitchMs>=15000){vebus.setSwitchState(VEBUS_SWITCH_STATE_OFF);autoSwitchMs=now;}
+        }
+        autoReason="Pausiert · MQTT / evcc offline";return;
+    }
+    if(autoBoostEffective&&!AutoPower::boostReady(autoCfg.boostEnabled,autoSample.boostActive,victronSocFresh(now),live.soc,autoCfg.boostMinSoc)){
+        autoBoostEffective=false;autoWanted=0;if(g_essPower>0)autoSetPower(0);
+    }
     if(autoLowLock && autoSleeping) {
         autoWanted=0;if(g_essPower)autoSetPower(0);
         // OFF may stop AC/voltage reports. Wake uses fresh external PV balance only.
         const bool ready=AutoPower::wakeReady(autoEnabled,complete,complete?now-next.atMs:0,
             complete&&next.solarValid,complete?next.demandW:0,complete?next.solarResidualW:0,
             complete?next.otherW:0,autoCfg.bydThresholdW,autoCfg.bydMinSoc,
-            complete&&next.bydSocValid,complete?next.bydSoc:0,autoCfg.wakeMinW,autoCfg.chargeW);
+            complete&&next.bydSocValid,complete?next.bydSoc:0,autoCfg.wakeMinW,autoCfg.chargeW,autoCfg.useMqtt?autoFreshWindow():7500);
         if(updated && !ready)autoSurplusTimer.reset();
-        if(!autoHaveSample || now-autoSample.atMs>7500)autoSurplusTimer.reset();
+        if(!autoHaveSample || now-autoSample.atMs>(autoCfg.useMqtt?autoFreshWindow():7500))autoSurplusTimer.reset();
         const bool stable=ready && autoSurplusTimer.observe(true,now,autoCfg.wakeDelayS);
         autoReason=autoSurplusTimer.tracking?"Warte · PV-Überschuss stabilisieren":"Mindestspannungs-Abschaltung · warte auf PV / BYD-Mindestladestand";
         if(stable &&
@@ -435,8 +510,10 @@ static void autoLoop(uint32_t now) {
         if(autoLowLock)autoSleep(now);
         return;
     }
-    if(!complete){g_lastEssCmdMs=now;if(now-autoSample.atMs>7500)autoReason="Warte auf evcc · letzten Sollwert halten";return;}
-    int wanted=AutoPower::target(autoSample.demandW,autoSample.otherW,autoCfg.chargeW,autoCfg.dischargeW,autoCfg.sharePct,autoCfg.bydThresholdW);
+    if(!complete){g_lastEssCmdMs=now;if(now-autoSample.atMs>(autoCfg.useMqtt?autoFreshWindow():7500))autoReason="Warte auf evcc · letzten Sollwert halten";return;}
+    autoBoostEffective=AutoPower::boostReady(autoCfg.boostEnabled,autoSample.boostActive,victronSocFresh(now),live.soc,autoCfg.boostMinSoc);
+    const int demand=AutoPower::boostDemand(autoSample.demandW,autoSample.boostChargeW,autoSample.boostActive,autoCfg.boostEnabled,autoBoostEffective);
+    int wanted=AutoPower::target(demand,autoSample.otherW,autoCfg.chargeW,autoCfg.dischargeW,autoBoostEffective?100:autoCfg.sharePct,autoCfg.bydThresholdW);
     wanted=AutoPower::solarGate(wanted,autoSample.solarValid,autoSample.solarResidualW,autoSample.otherW,autoCfg.chargeW,autoCfg.bydThresholdW);
     const bool priorityStop=wanted<0 && !AutoPower::priorityReady(autoCfg.bydMinSoc,autoSample.bydSocValid,autoSample.bydSoc);
     wanted=AutoPower::chargePriority(wanted,autoCfg.bydMinSoc,autoSample.bydSocValid,autoSample.bydSoc);
@@ -445,8 +522,50 @@ static void autoLoop(uint32_t now) {
     // A low-voltage wake is for solar charging only; stop again when usable surplus disappears.
     if(autoLowLock && autoWanted>=0){autoSleep(now);return;}
     autoReason=priorityStop?"Warte · BYD-Mindestladestand nicht erreicht / fehlt":voltageStop?"Entladesperre · Batteriespannung":
-        autoWanted>0?"Entladen · eingestellter Victron-Anteil":autoWanted<0?"Laden · PV-Überschuss":
+        autoWanted>0?(autoBoostEffective?"Entladen · evcc Batterie-Boost":"Entladen · eingestellter Victron-Anteil"):autoWanted<0?"Laden · PV-Überschuss":
         autoSample.otherW>autoCfg.bydThresholdW?"Pausiert · BYD entlädt":"Bereit · kein freigegebener Bedarf / Überschuss";
+    const uint8_t mode=vebus.getSwitchRegister()&(VEBUS_SWITCH_CHARGE|VEBUS_SWITCH_INVERT);
+    const time_t restartNow=time(nullptr);const uint32_t restartDay=localDate(restartNow);
+    const uint32_t restartEpoch=restartDay?(uint32_t)restartNow:0;
+    const bool restartAvailable=restartBudgetStorageOk&&restartBudget.available(restartDay,restartEpoch);
+    const bool restartDelivering=live.mainsW>=50||AutoPower::dischargeWatts(batSampleV,batSampleA)>=50;
+    if(essRestart.observe(now,restartAvailable&&autoWanted>=200&&g_essPower>=200&&acFresh(now)&&
+        mode==(VEBUS_SWITCH_CHARGE|VEBUS_SWITCH_INVERT)&&essRestartSafe(now,false),restartDelivering)){
+        if(!reserveRestartBudget(restartDay,restartEpoch)){
+            essRestart.cancel();autoSetPower(0);autoWanted=0;
+            autoReason="ESS-Neustart gesperrt · Tageszähler nicht gespeichert";return;
+        }
+        autoSetPower(0);autoWanted=0;
+        vebus.setSwitchState(VEBUS_SWITCH_STATE_OFF);
+        autoReason=essRestart.status();return;
+    }
+    const bool dischargePermitted=autoWanted>0 && !autoLowLock &&
+        !dischargeBlocked() && vebus.dcLevelAllowsInverting();
+    if(essRecovery.beginDischarge(now,dischargePermitted,mode!=0)){
+        autoSetPower(0);
+        vebus.setSwitchState(VEBUS_SWITCH_STATE_ON);
+        autoReason="Entladen vorbereiten · Betriebsart Ein angefordert";
+        return;
+    }
+    const bool recoveryEligible=autoWanted>=200 && dischargePermitted && mode!=0 &&
+        (g_essPower>=200 || mode!=(VEBUS_SWITCH_CHARGE|VEBUS_SWITCH_INVERT));
+    const bool delivering=live.mainsW>=50 || AutoPower::dischargeWatts(batSampleV,batSampleA)>=50;
+    if(essRecovery.observe(now,recoveryEligible,delivering)){
+        vebus.enableVirtualSetpointMode(false);
+        autoSetPower(0);
+        vebus.setSwitchState(VEBUS_SWITCH_STATE_ON);
+        autoReason="ESS reagiert nicht · Betriebsart Ein erneut angefordert";
+        return;
+    }
+    if(recoveryEligible && essRecovery.exhausted)
+        autoReason="ESS liefert nicht · 3 Wiederholversuche ohne Erfolg";
+    if(autoWanted>0 && mode!=(VEBUS_SWITCH_CHARGE|VEBUS_SWITCH_INVERT)){
+        autoSetPower(0);
+        autoReason=mode==0?"Entladen pausiert · Gerät ausgeschaltet":
+            essRecovery.exhausted?"Betriebsart Ein nicht bestätigt · 3 Versuche ohne Erfolg":
+            "Warte auf Betriebsart Ein · Entladung noch nicht freigegeben";
+        return;
+    }
     autoSetPower(AutoPower::approach(g_essPower,autoWanted));
 }
 
@@ -468,13 +587,20 @@ static void busQuiet();
 static void busResume();
 
 // History ring buffer
-struct HistSample { int16_t out, mains, ess, batv, soc, bata; };
-HistSample hist[HIST_LEN];
-uint16_t   histHead  = 0;   // next write index
-uint16_t   histCount = 0;
-uint32_t   histLastMs = 0;
-int32_t    histAcc[6] = {0};
-uint16_t   histAccN   = 0;
+static History48::Window history;
+static History48::Accumulator histAcc;
+static FlashHistory flashHistory;
+static bool histHasClock=false;
+static uint32_t histLastMs=0,histSampleMs=0,histRestored=0;
+static uint32_t historyMinute(){time_t t=time(nullptr);return t>=1704067200LL&&t<=4102444799LL?(uint32_t)(t/60):0;}
+static void historyLoop(){
+    const uint32_t now=historyMinute();
+    if(now&&(!histHasClock||history.latest>now)){history.clear();histHasClock=true;}
+    History48::Point p;
+    for(unsigned i=0;i<16&&flashHistory.take(p);++i){
+        if(now&&History48::inWindow(p.minute,now)&&!history.get(p.minute)&&history.put(p))++histRestored;
+    }
+}
 
 // =======================================================================
 // Small helpers
@@ -591,6 +717,8 @@ static void loadConfig()
     cfg.nominalW    =      prefs.getUShort("nomw",    0);
     cfg.apcEnabled  =      prefs.getBool("apc",       true);
     cfg.batteryWh   =      prefs.getUShort("batwh",   0);
+    autoCfg.useMqtt=prefs.getBool("automqtt",false);workerUseMqtt=autoCfg.useMqtt;
+    autoCfg.boostEnabled=prefs.getBool("autoboost",true);autoCfg.boostMinSoc=prefs.getUChar("autobstsoc",10);if(autoCfg.boostMinSoc>100)autoCfg.boostMinSoc=10;
     autoCfg.sleepAtCutoff=prefs.getBool("autosleep",false);
     autoCfg.bydMinSoc=prefs.getUChar("autobydsoc",0);if(autoCfg.bydMinSoc>100)autoCfg.bydMinSoc=0;
     autoCfg.wakeMinW=prefs.getUShort("autowakew",200);if(autoCfg.wakeMinW<100||autoCfg.wakeMinW>10000)autoCfg.wakeMinW=200;
@@ -604,12 +732,16 @@ static void loadConfig()
     if(autoCfg.sharePct>100)autoCfg.sharePct=90;
     autoCfg.chargeW=prefs.getUShort("autocw",3000);
     autoCfg.dischargeW=prefs.getUShort("autodw",3000);
+    autoCfg.correctionFactor=prefs.getFloat("autovfactor",0);autoCfg.correctionMaxV=prefs.getFloat("autovmax",2);autoCfg.hardFloorV=prefs.getFloat("autovfloor",0);
     autoCfg.cutoffV=prefs.getFloat("autocut",0);
     autoCfg.resumeDeltaV=prefs.getFloat("autodelta",1);
     if(autoCfg.chargeW>32767)autoCfg.chargeW=3000;
     if(autoCfg.dischargeW>32767)autoCfg.dischargeW=3000;
     if(!isfinite(autoCfg.cutoffV) || (autoCfg.cutoffV!=0 && (autoCfg.cutoffV<38 || autoCfg.cutoffV>60)))autoCfg.cutoffV=0;
     if(!isfinite(autoCfg.resumeDeltaV) || autoCfg.resumeDeltaV<.1f || autoCfg.resumeDeltaV>5)autoCfg.resumeDeltaV=1;
+    if(!isfinite(autoCfg.correctionMaxV)||autoCfg.correctionMaxV<=0||autoCfg.correctionMaxV>5)autoCfg.correctionMaxV=2;
+    if(!isfinite(autoCfg.hardFloorV)||autoCfg.hardFloorV<38||autoCfg.hardFloorV>autoCfg.cutoffV)autoCfg.hardFloorV=0;
+    if(!isfinite(autoCfg.correctionFactor)||autoCfg.correctionFactor<0||autoCfg.correctionFactor>.005f||autoCfg.hardFloorV==0)autoCfg.correctionFactor=0;
     prefs.end();
     if (!cfg.nutUps[0]) strlcpy(cfg.nutUps, DEFAULT_NUT_UPS, sizeof(cfg.nutUps));
     if (cfg.mqttPort == 0) cfg.mqttPort = DEFAULT_MQTT_PORT;
@@ -635,13 +767,40 @@ static void saveConfig()
     prefs.putUShort("nomw",    cfg.nominalW);
     prefs.putBool("apc",       cfg.apcEnabled);
     prefs.putUShort("batwh",   cfg.batteryWh);
+    prefs.putBool("automqtt",autoCfg.useMqtt);prefs.putBool("autoboost",autoCfg.boostEnabled);prefs.putUChar("autobstsoc",autoCfg.boostMinSoc);
     prefs.putBool("autosleep",autoCfg.sleepAtCutoff);prefs.putUChar("autobydsoc",autoCfg.bydMinSoc);
     prefs.putUShort("autowakew",autoCfg.wakeMinW);prefs.putUShort("autowakes",autoCfg.wakeDelayS);
     prefs.putUShort("autobyd",autoCfg.bydThresholdW);prefs.putUShort("autowait",autoCfg.dataTimeoutS);
     prefs.putUChar("autoshare",autoCfg.sharePct);
     prefs.putUShort("autocw",autoCfg.chargeW);prefs.putUShort("autodw",autoCfg.dischargeW);
+    prefs.putFloat("autovfactor",autoCfg.correctionFactor);prefs.putFloat("autovmax",autoCfg.correctionMaxV);prefs.putFloat("autovfloor",autoCfg.hardFloorV);
     prefs.putFloat("autocut",autoCfg.cutoffV);prefs.putFloat("autodelta",autoCfg.resumeDeltaV);
     prefs.end();
+}
+
+// Verify the complete automatic configuration using the public NVS read path.
+// A successful HTTP response must mean these settings survived persistence.
+static bool autoConfigStored() {
+    Preferences stored;if(!stored.begin("vebus_mqtt",true))return false;
+    bool ok=true;
+    ok=ok&&stored.isKey("automqtt")&&stored.getBool("automqtt")==autoCfg.useMqtt;
+    ok=ok&&stored.isKey("autoboost")&&stored.getBool("autoboost")==autoCfg.boostEnabled;
+    ok=ok&&stored.isKey("autobstsoc")&&stored.getUChar("autobstsoc")==autoCfg.boostMinSoc;
+    ok=ok&&stored.isKey("autosleep")&&stored.getBool("autosleep")==autoCfg.sleepAtCutoff;
+    ok=ok&&stored.isKey("autobydsoc")&&stored.getUChar("autobydsoc")==autoCfg.bydMinSoc;
+    ok=ok&&stored.isKey("autowakew")&&stored.getUShort("autowakew")==autoCfg.wakeMinW;
+    ok=ok&&stored.isKey("autowakes")&&stored.getUShort("autowakes")==autoCfg.wakeDelayS;
+    ok=ok&&stored.isKey("autobyd")&&stored.getUShort("autobyd")==autoCfg.bydThresholdW;
+    ok=ok&&stored.isKey("autowait")&&stored.getUShort("autowait")==autoCfg.dataTimeoutS;
+    ok=ok&&stored.isKey("autoshare")&&stored.getUChar("autoshare")==autoCfg.sharePct;
+    ok=ok&&stored.isKey("autocw")&&stored.getUShort("autocw")==autoCfg.chargeW;
+    ok=ok&&stored.isKey("autodw")&&stored.getUShort("autodw")==autoCfg.dischargeW;
+    ok=ok&&stored.isKey("autovfactor")&&stored.getFloat("autovfactor")==autoCfg.correctionFactor;
+    ok=ok&&stored.isKey("autovmax")&&stored.getFloat("autovmax")==autoCfg.correctionMaxV;
+    ok=ok&&stored.isKey("autovfloor")&&stored.getFloat("autovfloor")==autoCfg.hardFloorV;
+    ok=ok&&stored.isKey("autocut")&&stored.getFloat("autocut")==autoCfg.cutoffV;
+    ok=ok&&stored.isKey("autodelta")&&stored.getFloat("autodelta")==autoCfg.resumeDeltaV;
+    stored.end();return ok;
 }
 
 static void makeHostName()
@@ -828,6 +987,9 @@ static void buildStateJson(Buf &j)
     char dayStart[32];dayStartText(dayStart,sizeof(dayStart));j.add("\"energy_day_start\":");if(timeValid)j.str(dayStart);else j.add("null");j.add(",");
     j.add("\"auto_byd_threshold_w\":%u,\"auto_data_timeout_s\":%u,",autoCfg.bydThresholdW,autoCfg.dataTimeoutS);
     j.add("\"auto_share_pct\":%u,",autoCfg.sharePct);
+    j.add("\"auto_source\":\"%s\",\"auto_boost_enabled\":%s,\"auto_boost_min_soc\":%u,\"auto_boost_supporting\":%s,",autoCfg.useMqtt?"mqtt":"http",autoCfg.boostEnabled?"true":"false",autoCfg.boostMinSoc,autoEnabled&&autoBoostEffective&&g_essPower>0?"true":"false");
+    j.add("\"auto_voltage_correction_factor\":%.6f,\"auto_voltage_correction_max_v\":%.2f,\"auto_hard_floor_v\":%.2f,",autoCfg.correctionFactor,autoCfg.correctionMaxV,autoCfg.hardFloorV);
+    j.add("\"auto_voltage_corrected_v\":");if(batFresh(millis()))j.add("%.2f",AutoPower::correctedVoltage(batSampleV,batSampleA,autoCfg.correctionFactor,autoCfg.correctionMaxV));else j.add("null");j.add(",");
     j.add("\"auto_sleep_at_cutoff\":%s,\"auto_low_voltage_lock\":%s,\"auto_sleeping\":%s,\"auto_byd_min_soc\":%u,\"auto_wake_min_w\":%u,\"auto_wake_delay_s\":%u,",autoCfg.sleepAtCutoff?"true":"false",autoLowLock?"true":"false",autoSleeping?"true":"false",autoCfg.bydMinSoc,autoCfg.wakeMinW,autoCfg.wakeDelayS);
     j.add("\"auto_enabled\":%s,\"auto_charge_limit_w\":%u,\"auto_discharge_limit_w\":%u,\"auto_cutoff_v\":%.2f,\"auto_resume_delta_v\":%.2f,",autoEnabled?"true":"false",autoCfg.chargeW,autoCfg.dischargeW,autoCfg.cutoffV,autoCfg.resumeDeltaV);
     j.add("\"energy_total_charge_kwh\":%.6f,\"energy_total_discharge_kwh\":%.6f,",energyBook.chargeWh/1000,energyBook.dischargeWh/1000);
@@ -961,6 +1123,9 @@ void mqttCallback(char *topicStr, byte *payload, unsigned int length)
     memcpy(msg, payload, len);
     msg[len] = '\0';
 
+    if(!strncmp(topicStr,"evcc/",5)) {
+        evccMqtt.ingest(topicStr,length<sizeof(msg)?msg:"",millis());return;
+    }
     // HA restarted → resend discovery
     if (!strcmp(topicStr, "homeassistant/status")) {
         if (!strcmp(msg, "online")) g_discIdx = 0;
@@ -1002,6 +1167,7 @@ static void connectMqtt()
         snprintf(sub, sizeof(sub), "%s/+/set", cfg.prefix);
         mqtt.subscribe(sub);
         mqtt.subscribe("homeassistant/status");
+        evccMqtt.reset();mqttEvccEmitMs=0;subscribeEvcc();
 
         g_discIdx = 0;          // discovery is sent incrementally from loop()
         g_publishNow = true;
@@ -1016,26 +1182,23 @@ static void connectMqtt()
 // =======================================================================
 static void histAccumulate()
 {
-    if (vebus.hasNoSync()) return;   // no data → leave a gap
-    int32_t v[6] = { lroundf(live.outW), lroundf(live.mainsW), vebus.getEffectiveESSPower(),
-                     lroundf(vebus.getBatVolt() * 100.0f), lroundf(live.soc * 10.0f),
-                     lroundf(live.batA * 10.0f) };
-    for (int i = 0; i < 6; i++) histAcc[i] += v[i];
-    histAccN++;
-}
-
-static void histPush()
-{
-    HistSample s;
-    int16_t *f = &s.out;
-    for (int i = 0; i < 6; i++) {
-        f[i] = histAccN ? (int16_t)constrain(histAcc[i] / histAccN, -32767, 32767) : HIST_GAP;
-        histAcc[i] = 0;
+    const uint32_t now=millis();if(vebus.hasNoSync())return;
+    if(acFresh(now)){
+        histAcc.add(0,live.outW);histAcc.add(1,live.mainsW);histAcc.add(2,vebus.getEffectiveESSPower());
     }
-    histAccN = 0;
-    hist[histHead] = s;
-    histHead = (histHead + 1) % HIST_LEN;
-    if (histCount < HIST_LEN) histCount++;
+    if(batFresh(now)){
+        histAcc.add(3,batSampleV*100);histAcc.add(5,batSampleA*10);
+    }
+    if(victronSocFresh(now))histAcc.add(4,live.soc*10);
+}
+static void histPush(bool delayed=false)
+{
+    historyLoop();History48::Sample sample=histAcc.finish();
+    if(delayed)for(auto &v:sample.value)v=History48::GAP;
+    const uint32_t minute=historyMinute();
+    if(!minute&&histHasClock)return;
+    History48::Point point={minute?minute:millis()/60000+1,sample};
+    if(history.put(point)&&minute)flashHistory.enqueue(point);
 }
 
 // =======================================================================
@@ -1175,31 +1338,26 @@ static void handleSystem() {
     String out;serializeJson(doc,out);sendJson(out.c_str());
 }
 
-// Streams ~40 kB without building it in RAM.
+// Dense UTC minute grid: missing/offline minutes are null, never time-shifted.
 static void handleHistory()
 {
-    server.sendHeader("Cache-Control", "no-store");
-    server.setContentLength(CONTENT_LENGTH_UNKNOWN);
-    server.send(200, "application/json", "");
-
-    char buf[1200];
-    Buf j(buf, sizeof(buf));
-    j.add("{\"interval\":%lu,\"age\":%lu,\"cols\":[\"out\",\"mains\",\"ess\",\"batv\",\"soc\",\"bata\"],\"data\":[",
-          HIST_INTERVAL_MS / 1000, (unsigned long)((millis() - histLastMs) / 1000));
-    uint16_t start = (histHead + HIST_LEN - histCount) % HIST_LEN;
-    for (uint16_t i = 0; i < histCount; i++) {
-        const HistSample &s = hist[(start + i) % HIST_LEN];
-        if (i) j.add(",");
-        if (s.out == HIST_GAP) j.add("null");
-        else j.add("[%d,%d,%d,%d,%d,%d]", s.out, s.mains, s.ess, s.batv, s.soc, s.bata);
-        if (j.len > sizeof(buf) - 64) {
-            server.sendContent(buf, j.len);
-            j = Buf(buf, sizeof(buf));
-        }
+    server.sendHeader("Cache-Control","no-store");server.setContentLength(CONTENT_LENGTH_UNKNOWN);
+    server.send(200,"application/json","");
+    char buf[1200];Buf j(buf,sizeof(buf));const uint32_t first=history.first(),last=history.latest;
+    const uint32_t now=historyMinute();
+    j.add("{\"interval\":60,\"age\":%lu,\"clock_valid\":%s,\"end\":%lu,\"now\":%lu,\"retention_h\":24,\"count\":%lu,",
+        (unsigned long)((millis()-histLastMs)/1000),histHasClock?"true":"false",(unsigned long)(histHasClock?last*60UL:0),(unsigned long)(now*60UL),(unsigned long)history.count());
+    j.add("\"storage\":{\"ready\":%s,\"state\":%u,\"status\":",flashHistory.state==FlashHistory::Ready?"true":"false",(unsigned)flashHistory.state);j.str(flashHistory.status());
+    j.add(",\"total_bytes\":%lu,\"used_bytes\":%lu,\"recovered\":%lu,\"written\":%lu,\"restored\":%lu,\"dropped\":%lu,\"write_errors\":%lu,\"read_errors\":%lu,\"last_saved\":%lu},",
+        (unsigned long)flashHistory.totalBytes,(unsigned long)flashHistory.usedBytes,(unsigned long)flashHistory.recovered,(unsigned long)flashHistory.written,(unsigned long)histRestored,(unsigned long)flashHistory.dropped,(unsigned long)flashHistory.writeErrors,(unsigned long)flashHistory.readErrors,(unsigned long)(flashHistory.lastMinute*60UL));
+    j.add("\"cols\":[\"out\",\"mains\",\"ess\",\"batv\",\"soc\",\"bata\"],\"data\":[");
+    if(last)for(uint32_t minute=first;minute<=last;++minute){
+        if(minute!=first)j.add(",");const auto *p=history.get(minute);
+        if(!p||History48::empty(p->sample))j.add("null");
+        else{j.add("[");for(unsigned k=0;k<6;++k){if(k)j.add(",");if(p->sample.value[k]==History48::GAP)j.add("null");else j.add("%d",p->sample.value[k]);}j.add("]");}
+        if(j.len>sizeof(buf)-128){server.sendContent(buf,j.len);j=Buf(buf,sizeof(buf));}
     }
-    j.add("]}");
-    server.sendContent(buf, j.len);
-    server.sendContent("");
+    j.add("]}");server.sendContent(buf,j.len);server.sendContent("");
 }
 
 static void handleAcState() {
@@ -1363,8 +1521,27 @@ static void handlePostConfig()
 }
 
 static void handleAutoState() {
-    StaticJsonDocument<1536> doc;
-    doc["enabled"]=autoEnabled;doc["fresh"]=autoHaveSample&&autoSample.valid&&millis()-autoSample.atMs<=15000;
+    DynamicJsonDocument doc(3584);
+    const time_t restartNow=time(nullptr);const uint32_t restartDay=localDate(restartNow);
+    const uint32_t restartEpoch=restartDay?(uint32_t)restartNow:0;
+    doc["restart_daily_limit"]=2;doc["restart_today"]=restartBudget.count(restartDay);
+    doc["restart_day"]=restartDay;doc["restart_clock_valid"]=restartDay!=0;
+    doc["restart_storage_ok"]=restartBudgetStorageOk;
+    if(restartDay)doc["restart_cooldown_s"]=restartBudget.cooldown(restartEpoch);else doc["restart_cooldown_s"]=nullptr;
+    doc["restart_limit_status"]=!restartBudgetStorageOk?"Tageszähler nicht verfügbar · Neustart gesperrt":
+        !restartDay?"Warte auf gültige Uhrzeit":restartDay<restartBudget.record.day||restartEpoch<restartBudget.record.lastEpoch?"Uhrzeit zurückgesetzt · Neustart gesperrt":
+        restartBudget.count(restartDay)>=2?"Tageslimit erreicht":restartBudget.cooldown(restartEpoch)?"30 Minuten Mindestabstand abwarten":"Bereit";
+    doc["restart_used"]=essRestart.used;doc["restart_active"]=essRestart.active();doc["restart_status"]=essRestart.status();
+    doc["source"]=autoCfg.useMqtt?"mqtt":"http";doc["boost_enabled"]=autoCfg.boostEnabled;doc["boost_min_soc"]=autoCfg.boostMinSoc;
+    doc["boost_requested"]=autoSample.boostActive;doc["boost_supporting"]=autoEnabled&&autoBoostEffective&&g_essPower>0;
+    doc["boost_soc_ready"]=victronSocFresh(millis())&&live.soc>autoCfg.boostMinSoc;
+    if(victronSocFresh(millis()))doc["victron_soc"]=live.soc;else doc["victron_soc"]=nullptr;
+    doc["fetch_status"]=autoReceivedAttempt?autoLastAttempt.fetchError:"Noch kein evcc-Abruf abgeschlossen";
+    doc["fetch_http"]=autoLastAttempt.httpStatus;doc["fetch_bytes"]=autoLastAttempt.bytesRead;doc["fetch_ms"]=autoLastAttempt.durationMs;
+    if(autoReceivedAttempt)doc["last_attempt_age_s"]=(millis()-autoLastAttempt.atMs)/1000;else doc["last_attempt_age_s"]=nullptr;
+    doc["sample_available"]=autoHaveSample;
+    doc["ess_recovery_attempts"]=essRecovery.retries;doc["ess_recovery_exhausted"]=essRecovery.exhausted;
+    doc["enabled"]=autoEnabled;doc["fresh"]=autoHaveSample&&autoSample.valid&&millis()-autoSample.atMs<=autoFreshWindow()&&(!autoCfg.useMqtt||(mqtt.connected()&&evccMqtt.online));
     doc["sleep_at_cutoff"]=autoCfg.sleepAtCutoff;doc["sleeping"]=autoSleeping;doc["low_voltage_lock"]=autoLowLock;
     doc["byd_min_soc"]=autoCfg.bydMinSoc;doc["wake_min_w"]=autoCfg.wakeMinW;doc["wake_delay_s"]=autoCfg.wakeDelayS;
     if(autoHaveSample&&autoSample.bydSocValid)doc["byd_soc"]=autoSample.bydSoc;else doc["byd_soc"]=nullptr;
@@ -1374,6 +1551,11 @@ static void handleAutoState() {
     doc["solar_valid"]=autoSample.solarValid;doc["solar_residual_w"]=autoSample.solarResidualW;
     doc["grid_w"]=autoSample.gridW;doc["byd_w"]=autoSample.otherW;doc["victron_w"]=autoSample.victronW;doc["demand_w"]=autoSample.demandW;
     doc["charge_limit_w"]=autoCfg.chargeW;doc["discharge_limit_w"]=autoCfg.dischargeW;
+    doc["voltage_correction_factor"]=autoCfg.correctionFactor;doc["voltage_correction_max_v"]=autoCfg.correctionMaxV;doc["hard_floor_v"]=autoCfg.hardFloorV;
+    if(batFresh(millis())) {
+        doc["battery_voltage_v"]=batSampleV;doc["battery_discharge_w"]=AutoPower::dischargeWatts(batSampleV,batSampleA);
+        doc["voltage_corrected_v"]=AutoPower::correctedVoltage(batSampleV,batSampleA,autoCfg.correctionFactor,autoCfg.correctionMaxV);
+    }else{doc["battery_voltage_v"]=nullptr;doc["battery_discharge_w"]=nullptr;doc["voltage_corrected_v"]=nullptr;}
     doc["cutoff_v"]=autoCfg.cutoffV;doc["resume_delta_v"]=autoCfg.resumeDeltaV;doc["discharge_blocked"]=dischargeBlocked();
     String out;serializeJson(doc,out);sendJson(out.c_str());
 }
@@ -1387,9 +1569,22 @@ static void handleAutoConfig() {
 #ifdef VEBUS_READ_ONLY
     sendJson("{\"ok\":false,\"error\":\"Nur-Lesen-Firmware\"}",403);return;
 #endif
+    double source=autoCfg.useMqtt?1:0,boost=autoCfg.boostEnabled?1:0,boostSoc=autoCfg.boostMinSoc;
     double soc=autoCfg.bydMinSoc,wakeW=autoCfg.wakeMinW,wakeS=autoCfg.wakeDelayS,sleep=autoCfg.sleepAtCutoff?1:0;
+    double factor=autoCfg.correctionFactor,cap=autoCfg.correctionMaxV,floorV=autoCfg.hardFloorV;
     double charge,discharge,cutoff,delta,share=autoCfg.sharePct,byd=autoCfg.bydThresholdW,wait=autoCfg.dataTimeoutS;
-    if((server.hasArg("byd_min_soc")&&!autoNumber("byd_min_soc",soc))||soc<0||soc>100||floor(soc)!=soc||
+    double enteredFactor,enteredFloor,enteredCut;
+    if(autoNumber("voltage_correction_factor",enteredFactor)&&autoNumber("hard_floor_v",enteredFloor)&&autoNumber("cutoff_v",enteredCut)) {
+        if(enteredFactor>0&&enteredFloor==0){sendJson("{\"ok\":false,\"error\":\"Nicht gespeichert: Lastkorrektur benötigt eine unkompensierte Untergrenze zwischen 38 V und der Stoppspannung. Untergrenze 0 ist nur bei Faktor 0 erlaubt.\"}",400);return;}
+        if(enteredFloor!=0&&(enteredFloor<38||enteredFloor>enteredCut)){sendJson("{\"ok\":false,\"error\":\"Nicht gespeichert: Unkompensierte Untergrenze muss zwischen 38 V und der Stoppspannung liegen.\"}",400);return;}
+    }
+    if((server.hasArg("mqtt_source")&&!autoNumber("mqtt_source",source))||(source!=0&&source!=1)||
+       (server.hasArg("boost_enabled")&&!autoNumber("boost_enabled",boost))||(boost!=0&&boost!=1)||
+       (server.hasArg("boost_min_soc")&&!autoNumber("boost_min_soc",boostSoc))||boostSoc<0||boostSoc>100||floor(boostSoc)!=boostSoc||
+       (server.hasArg("voltage_correction_factor")&&!autoNumber("voltage_correction_factor",factor))||factor<0||factor>.005||
+       (server.hasArg("voltage_correction_max_v")&&!autoNumber("voltage_correction_max_v",cap))||cap<=0||cap>5||
+       (server.hasArg("hard_floor_v")&&!autoNumber("hard_floor_v",floorV))||floorV<0||
+       (server.hasArg("byd_min_soc")&&!autoNumber("byd_min_soc",soc))||soc<0||soc>100||floor(soc)!=soc||
        (server.hasArg("sleep_at_cutoff")&&!autoNumber("sleep_at_cutoff",sleep))||(sleep!=0&&sleep!=1)||
        (server.hasArg("wake_min_w")&&!autoNumber("wake_min_w",wakeW))||wakeW<100||wakeW>10000||floor(wakeW)!=wakeW||
        (server.hasArg("wake_delay_s")&&!autoNumber("wake_delay_s",wakeS))||wakeS<10||wakeS>600||floor(wakeS)!=wakeS||
@@ -1399,9 +1594,15 @@ static void handleAutoConfig() {
        !autoNumber("cutoff_v",cutoff)||!autoNumber("resume_delta_v",delta)||
        (server.hasArg("share_pct")&&!autoNumber("share_pct",share))||share<0||share>100||floor(share)!=share||
        charge<0||charge>32767||floor(charge)!=charge||discharge<0||discharge>32767||floor(discharge)!=discharge||
-       (cutoff!=0&&(cutoff<38||cutoff>60))||(sleep==1&&(cutoff==0||(charge>0&&wakeW>charge)))||delta<.1||delta>5) {
+       (cutoff!=0&&(cutoff<38||cutoff>60))||(floorV!=0&&(floorV<38||floorV>cutoff))||(factor>0&&(cutoff==0||floorV==0))||(sleep==1&&(cutoff==0||(charge>0&&wakeW>charge)))||delta<.1||delta>5) {
         sendJson("{\"ok\":false,\"error\":\"BYD-Ziel: 0–100 %; Wiederanlauf: 100–10000 W, 10–600 s; Abschalten benötigt eine Spannungsgrenze und einen Wiederanlaufwert bis zur Ladegrenze; Leistungs-/Spannungsgrenzen prüfen\"}",400);return;
     }
+    const bool sourceChanged=autoCfg.useMqtt!=(source==1);
+    autoCfg.useMqtt=source==1;workerUseMqtt=autoCfg.useMqtt;autoCfg.boostEnabled=boost==1;autoCfg.boostMinSoc=boostSoc;
+    if(sourceChanged){autoSetPower(0);autoWanted=0;autoHaveSample=false;autoSample=AutoSnapshot{};autoReceivedAttempt=false;autoLastAttempt=AutoSnapshot{};evccMqtt.reset();mqttEvccEmitMs=0;if(autoQueue)xQueueReset(autoQueue);if(mqtt.connected())subscribeEvcc();}
+    else if(autoEnabled&&autoSample.boostActive){autoSetPower(0);autoWanted=0;}
+    autoBoostEffective=false;
+    autoCfg.correctionFactor=factor;autoCfg.correctionMaxV=cap;autoCfg.hardFloorV=floorV;
     autoCfg.sleepAtCutoff=sleep==1;autoCfg.bydMinSoc=soc;autoCfg.wakeMinW=wakeW;autoCfg.wakeDelayS=wakeS;
     autoSurplusTimer.reset();
     autoCfg.bydThresholdW=byd;autoCfg.dataTimeoutS=wait;
@@ -1414,6 +1615,9 @@ static void handleAutoConfig() {
             autoSetPower(min((int)g_essPower,max(0,autoWanted)));
         } else if(g_essPower<0 && !AutoPower::priorityReady(autoCfg.bydMinSoc,autoSample.bydSocValid,autoSample.bydSoc))autoSetPower(0);
         else autoSetPower(g_essPower);
+    }
+    if(!autoConfigStored()) {
+        sendJson("{\"ok\":false,\"error\":\"Flash-Speicherung nicht bestätigt. Werte sind aktuell im RAM aktiv, aber nicht sicher dauerhaft gespeichert. Erneut speichern.\"}",503);return;
     }
     sendJson("{\"ok\":true}");
 }
@@ -1471,6 +1675,7 @@ static void handleAutoControl() {
     }
     // Never restore an automatic power command after a reboot.
     prefs.begin("vebus_mqtt", false); prefs.putBool("autosession", true); prefs.end();
+    essRecovery.reset();
     g_essDirty = false;
     vebus.enableVirtualSetpointMode(false);
     xQueueReset(autoQueue); autoHaveSample = false;
@@ -1597,7 +1802,7 @@ static void setupWebServer()
         server.send_P(200,"application/javascript; charset=utf-8",THEME_JS);
     });
     server.on("/style.css",        HTTP_GET,  [] {
-        server.sendHeader("Cache-Control", "max-age=3600");
+        server.sendHeader("Cache-Control", "no-cache");
         server.send_P(200, "text/css", STYLE_CSS);
     });
     server.on("/info",HTTP_GET,[]{server.sendHeader("Location","/info/system");server.send(302);});
@@ -1771,6 +1976,7 @@ void setup()
     if (!acRows) Serial.println("[battery-log] CSV allocation failed; measurement start blocked");
 
     loadConfig();
+    loadRestartBudget();
     voltageBlocked=autoCfg.cutoffV>0; // conservative restart: release at cutoff + hysteresis
     loadEnergy();
 
@@ -1834,7 +2040,8 @@ void setup()
         autoReason="Automatik gestartet · warte auf frische Messwerte";
     } else autoReason="Automatik nicht gestartet · evcc-Abruf nicht verfügbar";
 #endif
-    histLastMs = millis();
+    histLastMs = histSampleMs = millis();
+    flashHistory.begin();
     setupTaskWatchdog();
 }
 
@@ -1861,6 +2068,8 @@ void loop()
     STAGE(ST_MQTT);
     connectMqtt();
     mqtt.loop();
+    static uint32_t lastEvccFlags=0;
+    if(mqtt.connected()&&millis()-lastEvccFlags>=30000){subscribeEvcc(true);lastEvccFlags=millis();}
 
     STAGE(ST_UPS);
     if (cfg.nutEnabled && WiFi.status() == WL_CONNECTED) nut.begin();   // no-op once running
@@ -1958,6 +2167,7 @@ void loop()
             bool period = id == VEBUS_RAM_MAINS_PERIOD || id == VEBUS_RAM_INVERTER_PERIOD;
             float v = period ? scaler.frequency(id, raw) : scaler.value(id, raw);
             ups.set(id, v);
+            if(id==VEBUS_RAM_CHARGE_STATE){socHaveSample=!vebus.hasNoSync()&&isfinite(v)&&v>=0&&v<=100;socSampleMs=millis();}
             if (id == VEBUS_RAM_UBAT) { gotBatV = true; sampleV = v; }
             if (id == VEBUS_RAM_IBAT) { gotBatA = true; sampleA = v; }
             if (id == VEBUS_RAM_MAINS_POWER && !vebus.hasNoSync()) {
@@ -2036,10 +2246,11 @@ void loop()
     if(!batFresh(millis()))energyHaveSample=false;
     saveEnergy();
     STAGE(ST_PUBLISH);
+    historyLoop();
+    if(now-histSampleMs>=PUBLISH_INTERVAL_MS){histSampleMs=now;histAccumulate();}
     // Publish state periodically (or right after a command)
     if (now - lastPublishMs >= PUBLISH_INTERVAL_MS || g_publishNow)
     {
-        if (now - lastPublishMs >= PUBLISH_INTERVAL_MS) histAccumulate();
         lastPublishMs = now;
         g_publishNow  = false;
         if (vebus.hasNewData()) vebus.clearNewData();
@@ -2049,8 +2260,8 @@ void loop()
     STAGE(ST_HISTORY);
     if (now - histLastMs >= HIST_INTERVAL_MS)
     {
-        histLastMs += HIST_INTERVAL_MS;
-        histPush();
+        const bool delayed=now-histLastMs>HIST_INTERVAL_MS+30000;
+        histLastMs=now;histPush(delayed);
     }
 
     STAGE(ST_SERIAL);

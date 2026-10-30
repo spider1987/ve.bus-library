@@ -18,7 +18,7 @@ const s = fs.readFileSync("examples/mqtt_ha/web_ui.h", "utf8"),
     [100, 35.5, false],
   ]) {
     let posted = null;
-    const els = {
+    const els = {autoDataSource:{value:"0"},autoBoostOn:{checked:true},autoBoostSoc:{value:"10"},autoVoltFactor:{value:"0"},autoVoltCap:{value:"2"},autoVoltFloor:{value:"0"},
       autoSleepAtCutoff: { checked: false },
       autoBydMinSoc: { value: "80" },autoWakeMinW: { value: "200" },autoWakeDelay: { value: "30" },
       autoBydThreshold: { value: String(byd) },
