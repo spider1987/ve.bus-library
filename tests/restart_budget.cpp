@@ -2,22 +2,18 @@
 #include <cassert>
 #include <iostream>
 int main(){
- const uint32_t t=1793300000,day=20261029;
- RestartBudget b;assert(RestartBudget::valid(b.record));
- assert(!b.available(0,0));assert(!b.reserve(0,t));
- assert(b.reserve(day,t));assert(b.count(day)==1&&b.cooldown(t)==1800);
- // Restore the exact persisted record as on a controller reboot.
- RestartBudget reboot;reboot.record=b.record;
- assert(!reboot.reserve(day,t+1799));assert(reboot.cooldown(t+1799)==1);
- assert(reboot.reserve(day,t+1800));assert(reboot.count(day)==2);
- assert(!reboot.reserve(day,t+7200)); // third attempt refused
- assert(!reboot.reserve(day-1,t+9000)); // clock/date rollback
- assert(!reboot.reserve(day+1,t+1799)); // epoch rollback
- assert(reboot.count(day+1)==0);
- assert(!reboot.reserve(day+1,t+1801)); // midnight does not erase cooldown
- assert(reboot.reserve(day+1,t+3600));assert(reboot.count(day+1)==1);
- RestartBudget::Record corrupt=reboot.record;corrupt.count=3;
- assert(!RestartBudget::valid(corrupt));
- assert(!reboot.available(21010101,4102444799UL));
- std::cout<<"Restart budget: two/day, 30-minute spacing, reboot replay, midnight, rollback and invalid clock/storage OK\n";
+ RestartBudget b;
+ assert(b.reserve(0));assert(b.count(0)==1&&b.cooldown(0)==1800);
+ assert(b.count(100)==1);assert(b.count(99)==1);assert(b.cooldown(99)==1800);
+ assert(!b.reserve(1799999));assert(b.cooldown(1799999)==1);
+ assert(b.reserve(1800000));assert(b.count(1800000)==2);
+ assert(!b.reserve(3599999));assert(b.cooldown(3599999)==1);
+ assert(b.reserve(3600000));assert(b.count(3600000)==2);
+ assert(b.count(7200000)==0);assert(b.available(7200000));
+ RestartBudget reboot;assert(reboot.count(0)==0&&reboot.available(0));
+ RestartBudget wrap;const uint32_t start=0xffff0000UL;
+ assert(wrap.reserve(start));assert(!wrap.reserve(uint32_t(start+1799999UL)));
+ assert(wrap.reserve(uint32_t(start+1800000UL)));assert(!wrap.reserve(uint32_t(start+3599999UL)));
+ assert(wrap.reserve(uint32_t(start+3600000UL)));
+ std::cout<<"Restart budget: two/rolling hour, 30-minute spacing, failed attempt counted, reboot reset and millis rollover OK\n";
 }

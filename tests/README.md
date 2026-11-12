@@ -81,3 +81,23 @@ Zeitüberschreitung, manueller Abbruch.
 Wiederherstellung des gespeicherten Records, Mitternacht ohne Umgehen des
 Abstands, zurückspringende/ungültige Uhrzeit und fehlerhafte Records.
 Die tatsächliche NVS-Speicherung muss nach Installation am Gerät geprüft werden.
+
+Entladeaufschlag:
+- `g++ -std=c++11 tests/discharge_offset.cpp -o .pio/build/discharge-offset-test`
+  und `.pio/build/discharge-offset-test`: produktive Zielberechnung, Anteil,
+  Aufschlag, Leistungsgrenzen, Null-Anteil, BYD-Sperre, Totzone und PV-Laden.
+- `node tests/discharge_offset_ui.cjs`: Laden, Polling bei ungespeicherten
+  Eingaben, Absenden, 0/50/500 W und ungültige Grenzen sowie eindeutige Gruppen.
+Die tatsächlich gespeicherte NVS-Konfiguration und Netzregelwirkung müssen nach
+Installation am Gerät geprüft werden.
+
+`node tests/voltage_preview_ui.cjs`: aktuelle Formulareingaben ohne POST,
+Screenshot-Rechnung, Korrekturbegrenzung, Messwert-Updates bei ungespeicherten
+Eingaben, leere/ungültige Felder, ausgeschaltete Sperre, Laden/0 W,
+veraltete Messwerte und getrennte wirksame Geräteeinstellungen.
+
+
+ESS timeout regression: `tests/ess_timeout.cpp` checks older loop timestamps,
+actual deadline, disabled timeout and millis rollover.
+`node tests/ess_timeout_integration.cjs` checks watchdog ordering, configured
+external-data hold and immediate local measurement protection.

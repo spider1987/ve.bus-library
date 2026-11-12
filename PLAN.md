@@ -1,5 +1,21 @@
 # ESS response recovery
 
+## Adjustable discharge offset and organized automation settings
+
+Add 0..500 W fixed discharge offset (default 0 preserves existing behavior),
+after the configured share and before the discharge cap. Only a positive,
+permitted normal demand can receive the offset: share 0, deadband, PV surplus,
+BYD charging prohibition, voltage guards and zero discharge cap stay effective.
+Apply the same target in normal regulation, restart eligibility and immediate
+reductions. Persist and verify NVS autoextra; expose HTTP/MQTT and saved UI.
+No live setpoint/config changes. Offset is feed-forward, not guaranteed site
+grid control, especially with a parallel GoodWe/BYD regulator.
+Restructure the existing single automation form into labeled native details
+groups, retaining all IDs, one save action and edit-preserving polling.
+Show offset separately from percent and measured power; version CSS URL.
+Test productive C++ target, UI roundtrip/validation, existing safety gates,
+native menus and all three themes at established viewport widths; build both.
+
 ## Design refresh using OpenDesign / Baseline UI
 
 Use the actual upstream baseline-ui skill, loaded project-locally under
@@ -82,3 +98,22 @@ virtual-mode reset, then resume normal ramping. Limit retries and expose them
 in the automation API. Never switch the device on/off or bypass voltage/BMS
 permissions. Validate the timing policy natively and compile both firmware
 variants; physical recovery remains unverified until installed.
+
+
+## 2026-11-01: Hourly inverter restart budget
+
+User requests two attempts per rolling hour and reset on LilyGo reboot. Replace
+the persistent calendar-day budget with a RAM-only monotonic timer budget; keep
+30-minute spacing and all existing OFF/ON safety gates. Count failed attempts,
+expose hourly count and wait time in API/UI, validate rollover and reboot reset,
+then compile both variants. No physical switching during validation.
+
+
+## 2026-11-03: Avoid unintended zero during web interaction
+
+Confirmed: loop captures now before blocking web/MQTT processing; autoLoop updates
+g_lastEssCmdMs with a newer clock, then ESS watchdog subtracts the old now,
+underflows and immediately zeros power. Refresh clock after autoLoop, use tested
+wrap-safe elapsed policy, and let MQTT disconnect use existing configured external
+data hold window. Local measurement/voltage protection and recovery gates remain
+immediate. Validate timing, source handling, UI and both builds; no live writes.

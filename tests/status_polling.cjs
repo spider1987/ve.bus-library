@@ -6,7 +6,7 @@ const logic=script.slice(0,script.indexOf('function nice('));
 let writes=0,fetches=0,pending=null,slow=false,fail=false;
 const els={},get=id=>els[id]??={style:{},parentElement:{setAttribute(){}},attrs:{},getAttribute(k){return this.attrs[k]},setAttribute(k,v){this.attrs[k]=v},get textContent(){return this.text||''},set textContent(v){if(id.startsWith('operating'))writes++;this.text=v}};
 const s={sync:'ON',switch_state:'on',dc_allows_inv:'ON',discharge_blocked:false,read_only:false,battery_fresh:true,bat_current:-5,bat_volt:49,output_power:0,mains_power:0,soc:50,ess_power:1000,ess_power_eff:1000,rssi:-50,uptime:100,free_heap:90000};
-const a={enabled:true,fresh:true,status:'Entladen',restart_today:0,restart_daily_limit:2};
+const a={enabled:true,fresh:true,status:'Entladen',restart_last_hour:0,restart_hourly_limit:2};
 const c={document:{getElementById:get,querySelectorAll:()=>[]},location:{pathname:'/'},fetch:async url=>{fetches++;if(url==='/api/state')return {json:async()=>s};if(fail)throw Error('offline');if(slow)return new Promise(resolve=>pending=resolve);return {ok:true,json:async()=>a}}};
 vm.createContext(c);vm.runInContext(logic,c);
 (async()=>{

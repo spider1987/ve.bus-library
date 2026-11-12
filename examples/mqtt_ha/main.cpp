@@ -41,6 +41,7 @@
 #include "EssRecovery.h"
 #include "EssRestart.h"
 #include "RestartBudget.h"
+#include "EssTimeout.h"
 #include "EvccReader.h"
 #include "EvccState.h"
 #include "EvccMqtt.h"
@@ -211,7 +212,7 @@ bool     g_otaAuthed      = false;
 bool     g_essDirty       = false;   // ESS setpoint / virtual mode not yet in NVS
 uint32_t g_essSavedMs     = 0;
 
-struct AutoSettings { bool useMqtt=false,boostEnabled=true;uint8_t boostMinSoc=10; uint16_t chargeW=3000, dischargeW=3000; bool sleepAtCutoff=false; uint8_t bydMinSoc=0; uint16_t wakeMinW=200, wakeDelayS=30; uint8_t sharePct=90; uint16_t bydThresholdW=100, dataTimeoutS=35; float correctionFactor=0, correctionMaxV=2, hardFloorV=0; float cutoffV=0, resumeDeltaV=1; } autoCfg;
+struct AutoSettings { bool useMqtt=false,boostEnabled=true;uint8_t boostMinSoc=10; uint16_t chargeW=3000, dischargeW=3000, dischargeOffsetW=0; bool sleepAtCutoff=false; uint8_t bydMinSoc=0; uint16_t wakeMinW=200, wakeDelayS=30; uint8_t sharePct=90; uint16_t bydThresholdW=100, dataTimeoutS=35; float correctionFactor=0, correctionMaxV=2, hardFloorV=0; float cutoffV=0, resumeDeltaV=1; } autoCfg;
 static bool autoLowLock=false, autoSleeping=false;
 static uint32_t autoSwitchMs=0, autoWakeMs=0;
 static AutoPower::SurplusTimer autoSurplusTimer;
@@ -358,29 +359,6 @@ static void autoWorker(void *) {
 static EssRecovery essRecovery;
 static EssRestart essRestart;
 static RestartBudget restartBudget;
-static bool restartBudgetStorageOk=true;
-static void loadRestartBudget(){
-    Preferences store;
-    if(!store.begin("vebus_mqtt",true)){restartBudgetStorageOk=false;return;}
-    if(store.isKey("restartday")){
-        const size_t n=store.getBytesLength("restartday");
-        restartBudgetStorageOk=n==sizeof(RestartBudget::Record)&&
-            store.getBytes("restartday",&restartBudget.record,sizeof(restartBudget.record))==sizeof(restartBudget.record)&&
-            RestartBudget::valid(restartBudget.record);
-    }
-    store.end();
-}
-static bool reserveRestartBudget(uint32_t day,uint32_t epoch){
-    if(!restartBudgetStorageOk||!restartBudget.reserve(day,epoch))return false;
-    Preferences store;RestartBudget::Record check;
-    if(!store.begin("vebus_mqtt",false)){restartBudgetStorageOk=false;return false;}
-    restartBudgetStorageOk=store.putBytes("restartday",&restartBudget.record,sizeof(restartBudget.record))==sizeof(restartBudget.record);
-    store.end();
-    if(!store.begin("vebus_mqtt",true)){restartBudgetStorageOk=false;return false;}
-    restartBudgetStorageOk=restartBudgetStorageOk&&store.getBytes("restartday",&check,sizeof(check))==sizeof(check)&&
-        check.day==restartBudget.record.day&&check.count==restartBudget.record.count&&check.lastEpoch==restartBudget.record.lastEpoch;
-    store.end();return restartBudgetStorageOk;
-}
 static void autoSetPower(int watts) {
     g_essPower = (int16_t)AutoPower::bounded(watts,autoCfg.chargeW,autoCfg.dischargeW);
     g_lastEssCmdMs = millis();
@@ -411,7 +389,7 @@ static bool essRestartSafe(uint32_t now,bool duringOff){
     const bool modeFresh=vebus.getSwitchUpdateMs()&&now-vebus.getSwitchUpdateMs()<=10000;
     const bool boost=AutoPower::boostReady(autoCfg.boostEnabled,autoSample.boostActive,victronSocFresh(now),live.soc,autoCfg.boostMinSoc);
     const int demand=AutoPower::boostDemand(autoSample.demandW,autoSample.boostChargeW,autoSample.boostActive,autoCfg.boostEnabled,boost);
-    const int target=AutoPower::target(demand,autoSample.otherW,autoCfg.chargeW,autoCfg.dischargeW,boost?100:autoCfg.sharePct,autoCfg.bydThresholdW);
+    const int target=AutoPower::target(demand,autoSample.otherW,autoCfg.chargeW,autoCfg.dischargeW,boost?100:autoCfg.sharePct,autoCfg.bydThresholdW,autoCfg.dischargeOffsetW);
     return autoEnabled&&external&&voltage&&modeFresh&&vebus.isTxEnabled()&&
         !autoLowLock&&!autoSleeping&&!voltageBlocked&&
         !((vebus.getLEDon()|vebus.getLEDblink())&alarms)&&target>=200;
@@ -447,15 +425,6 @@ static void autoLoop(uint32_t now) {
     // Fresh voltage, not a stale/no-data guard, may trigger a device shutdown.
     if(autoCfg.sleepAtCutoff && autoCfg.cutoffV>0 && !autoLowLock && batFresh(now) &&
        AutoPower::voltageStop(batSampleV,batSampleA,autoCfg.cutoffV,autoCfg.correctionFactor,autoCfg.correctionMaxV,autoCfg.hardFloorV) && (vebus.getSwitchRegister()&(VEBUS_SWITCH_CHARGE|VEBUS_SWITCH_INVERT)) && vebus.isTxEnabled()) { autoSleep(now);return; }
-    if(autoCfg.useMqtt && (!mqtt.connected()||!evccMqtt.online)){
-        autoBoostEffective=false;autoWanted=0;if(g_essPower)autoSetPower(0);
-        autoSurplusTimer.reset();
-        if(autoLowLock&&vebus.isTxEnabled()){
-            if(!autoSleeping)autoSleep(now);
-            else if(now-autoSwitchMs>=15000){vebus.setSwitchState(VEBUS_SWITCH_STATE_OFF);autoSwitchMs=now;}
-        }
-        autoReason="Pausiert · MQTT / evcc offline";return;
-    }
     if(autoBoostEffective&&!AutoPower::boostReady(autoCfg.boostEnabled,autoSample.boostActive,victronSocFresh(now),live.soc,autoCfg.boostMinSoc)){
         autoBoostEffective=false;autoWanted=0;if(g_essPower>0)autoSetPower(0);
     }
@@ -513,7 +482,7 @@ static void autoLoop(uint32_t now) {
     if(!complete){g_lastEssCmdMs=now;if(now-autoSample.atMs>(autoCfg.useMqtt?autoFreshWindow():7500))autoReason="Warte auf evcc · letzten Sollwert halten";return;}
     autoBoostEffective=AutoPower::boostReady(autoCfg.boostEnabled,autoSample.boostActive,victronSocFresh(now),live.soc,autoCfg.boostMinSoc);
     const int demand=AutoPower::boostDemand(autoSample.demandW,autoSample.boostChargeW,autoSample.boostActive,autoCfg.boostEnabled,autoBoostEffective);
-    int wanted=AutoPower::target(demand,autoSample.otherW,autoCfg.chargeW,autoCfg.dischargeW,autoBoostEffective?100:autoCfg.sharePct,autoCfg.bydThresholdW);
+    int wanted=AutoPower::target(demand,autoSample.otherW,autoCfg.chargeW,autoCfg.dischargeW,autoBoostEffective?100:autoCfg.sharePct,autoCfg.bydThresholdW,autoCfg.dischargeOffsetW);
     wanted=AutoPower::solarGate(wanted,autoSample.solarValid,autoSample.solarResidualW,autoSample.otherW,autoCfg.chargeW,autoCfg.bydThresholdW);
     const bool priorityStop=wanted<0 && !AutoPower::priorityReady(autoCfg.bydMinSoc,autoSample.bydSocValid,autoSample.bydSoc);
     wanted=AutoPower::chargePriority(wanted,autoCfg.bydMinSoc,autoSample.bydSocValid,autoSample.bydSoc);
@@ -525,15 +494,13 @@ static void autoLoop(uint32_t now) {
         autoWanted>0?(autoBoostEffective?"Entladen · evcc Batterie-Boost":"Entladen · eingestellter Victron-Anteil"):autoWanted<0?"Laden · PV-Überschuss":
         autoSample.otherW>autoCfg.bydThresholdW?"Pausiert · BYD entlädt":"Bereit · kein freigegebener Bedarf / Überschuss";
     const uint8_t mode=vebus.getSwitchRegister()&(VEBUS_SWITCH_CHARGE|VEBUS_SWITCH_INVERT);
-    const time_t restartNow=time(nullptr);const uint32_t restartDay=localDate(restartNow);
-    const uint32_t restartEpoch=restartDay?(uint32_t)restartNow:0;
-    const bool restartAvailable=restartBudgetStorageOk&&restartBudget.available(restartDay,restartEpoch);
+    const bool restartAvailable=restartBudget.available(now);
     const bool restartDelivering=live.mainsW>=50||AutoPower::dischargeWatts(batSampleV,batSampleA)>=50;
     if(essRestart.observe(now,restartAvailable&&autoWanted>=200&&g_essPower>=200&&acFresh(now)&&
         mode==(VEBUS_SWITCH_CHARGE|VEBUS_SWITCH_INVERT)&&essRestartSafe(now,false),restartDelivering)){
-        if(!reserveRestartBudget(restartDay,restartEpoch)){
+        if(!restartBudget.reserve(now)){
             essRestart.cancel();autoSetPower(0);autoWanted=0;
-            autoReason="ESS-Neustart gesperrt · Tageszähler nicht gespeichert";return;
+            autoReason="ESS-Neustart gesperrt · Stundenlimit / Wartezeit";return;
         }
         autoSetPower(0);autoWanted=0;
         vebus.setSwitchState(VEBUS_SWITCH_STATE_OFF);
@@ -728,6 +695,7 @@ static void loadConfig()
     autoCfg.dataTimeoutS=prefs.getUShort("autowait",35);
     if(autoCfg.bydThresholdW>1000)autoCfg.bydThresholdW=100;
     if(autoCfg.dataTimeoutS<5 || autoCfg.dataTimeoutS>120)autoCfg.dataTimeoutS=35;
+    autoCfg.dischargeOffsetW=prefs.getUShort("autoextra",0);if(autoCfg.dischargeOffsetW>500)autoCfg.dischargeOffsetW=0;
     autoCfg.sharePct=prefs.getUChar("autoshare",90);
     if(autoCfg.sharePct>100)autoCfg.sharePct=90;
     autoCfg.chargeW=prefs.getUShort("autocw",3000);
@@ -771,6 +739,7 @@ static void saveConfig()
     prefs.putBool("autosleep",autoCfg.sleepAtCutoff);prefs.putUChar("autobydsoc",autoCfg.bydMinSoc);
     prefs.putUShort("autowakew",autoCfg.wakeMinW);prefs.putUShort("autowakes",autoCfg.wakeDelayS);
     prefs.putUShort("autobyd",autoCfg.bydThresholdW);prefs.putUShort("autowait",autoCfg.dataTimeoutS);
+    prefs.putUShort("autoextra",autoCfg.dischargeOffsetW);
     prefs.putUChar("autoshare",autoCfg.sharePct);
     prefs.putUShort("autocw",autoCfg.chargeW);prefs.putUShort("autodw",autoCfg.dischargeW);
     prefs.putFloat("autovfactor",autoCfg.correctionFactor);prefs.putFloat("autovmax",autoCfg.correctionMaxV);prefs.putFloat("autovfloor",autoCfg.hardFloorV);
@@ -792,6 +761,7 @@ static bool autoConfigStored() {
     ok=ok&&stored.isKey("autowakes")&&stored.getUShort("autowakes")==autoCfg.wakeDelayS;
     ok=ok&&stored.isKey("autobyd")&&stored.getUShort("autobyd")==autoCfg.bydThresholdW;
     ok=ok&&stored.isKey("autowait")&&stored.getUShort("autowait")==autoCfg.dataTimeoutS;
+    ok=ok&&stored.isKey("autoextra")&&stored.getUShort("autoextra")==autoCfg.dischargeOffsetW;
     ok=ok&&stored.isKey("autoshare")&&stored.getUChar("autoshare")==autoCfg.sharePct;
     ok=ok&&stored.isKey("autocw")&&stored.getUShort("autocw")==autoCfg.chargeW;
     ok=ok&&stored.isKey("autodw")&&stored.getUShort("autodw")==autoCfg.dischargeW;
@@ -986,7 +956,7 @@ static void buildStateJson(Buf &j)
     const EnergyDay *today=todayEnergy(),*yesterday=yesterdayEnergy();
     char dayStart[32];dayStartText(dayStart,sizeof(dayStart));j.add("\"energy_day_start\":");if(timeValid)j.str(dayStart);else j.add("null");j.add(",");
     j.add("\"auto_byd_threshold_w\":%u,\"auto_data_timeout_s\":%u,",autoCfg.bydThresholdW,autoCfg.dataTimeoutS);
-    j.add("\"auto_share_pct\":%u,",autoCfg.sharePct);
+    j.add("\"auto_share_pct\":%u,\"auto_discharge_offset_w\":%u,",autoCfg.sharePct,autoCfg.dischargeOffsetW);
     j.add("\"auto_source\":\"%s\",\"auto_boost_enabled\":%s,\"auto_boost_min_soc\":%u,\"auto_boost_supporting\":%s,",autoCfg.useMqtt?"mqtt":"http",autoCfg.boostEnabled?"true":"false",autoCfg.boostMinSoc,autoEnabled&&autoBoostEffective&&g_essPower>0?"true":"false");
     j.add("\"auto_voltage_correction_factor\":%.6f,\"auto_voltage_correction_max_v\":%.2f,\"auto_hard_floor_v\":%.2f,",autoCfg.correctionFactor,autoCfg.correctionMaxV,autoCfg.hardFloorV);
     j.add("\"auto_voltage_corrected_v\":");if(batFresh(millis()))j.add("%.2f",AutoPower::correctedVoltage(batSampleV,batSampleA,autoCfg.correctionFactor,autoCfg.correctionMaxV));else j.add("null");j.add(",");
@@ -1522,15 +1492,12 @@ static void handlePostConfig()
 
 static void handleAutoState() {
     DynamicJsonDocument doc(3584);
-    const time_t restartNow=time(nullptr);const uint32_t restartDay=localDate(restartNow);
-    const uint32_t restartEpoch=restartDay?(uint32_t)restartNow:0;
-    doc["restart_daily_limit"]=2;doc["restart_today"]=restartBudget.count(restartDay);
-    doc["restart_day"]=restartDay;doc["restart_clock_valid"]=restartDay!=0;
-    doc["restart_storage_ok"]=restartBudgetStorageOk;
-    if(restartDay)doc["restart_cooldown_s"]=restartBudget.cooldown(restartEpoch);else doc["restart_cooldown_s"]=nullptr;
-    doc["restart_limit_status"]=!restartBudgetStorageOk?"Tageszähler nicht verfügbar · Neustart gesperrt":
-        !restartDay?"Warte auf gültige Uhrzeit":restartDay<restartBudget.record.day||restartEpoch<restartBudget.record.lastEpoch?"Uhrzeit zurückgesetzt · Neustart gesperrt":
-        restartBudget.count(restartDay)>=2?"Tageslimit erreicht":restartBudget.cooldown(restartEpoch)?"30 Minuten Mindestabstand abwarten":"Bereit";
+    const uint32_t restartMs=millis();
+    doc["restart_hourly_limit"]=2;doc["restart_last_hour"]=restartBudget.count(restartMs);
+    doc["restart_window_s"]=3600;doc["restart_reset_on_boot"]=true;
+    doc["restart_cooldown_s"]=restartBudget.cooldown(restartMs);
+    doc["restart_limit_status"]=restartBudget.count(restartMs)>=2?"Stundenlimit erreicht":
+        restartBudget.cooldown(restartMs)?"30 Minuten Mindestabstand abwarten":"Bereit";
     doc["restart_used"]=essRestart.used;doc["restart_active"]=essRestart.active();doc["restart_status"]=essRestart.status();
     doc["source"]=autoCfg.useMqtt?"mqtt":"http";doc["boost_enabled"]=autoCfg.boostEnabled;doc["boost_min_soc"]=autoCfg.boostMinSoc;
     doc["boost_requested"]=autoSample.boostActive;doc["boost_supporting"]=autoEnabled&&autoBoostEffective&&g_essPower>0;
@@ -1547,6 +1514,7 @@ static void handleAutoState() {
     if(autoHaveSample&&autoSample.bydSocValid)doc["byd_soc"]=autoSample.bydSoc;else doc["byd_soc"]=nullptr;
     doc["byd_threshold_w"]=autoCfg.bydThresholdW;doc["data_timeout_s"]=autoCfg.dataTimeoutS;
     doc["data_age_s"]=autoHaveSample?(millis()-autoSample.atMs)/1000:0;
+    doc["discharge_offset_w"]=autoCfg.dischargeOffsetW;
     doc["status"]=autoReason;doc["share_pct"]=autoCfg.sharePct;doc["target_w"]=autoWanted;doc["setpoint_w"]=g_essPower;
     doc["solar_valid"]=autoSample.solarValid;doc["solar_residual_w"]=autoSample.solarResidualW;
     doc["grid_w"]=autoSample.gridW;doc["byd_w"]=autoSample.otherW;doc["victron_w"]=autoSample.victronW;doc["demand_w"]=autoSample.demandW;
@@ -1569,6 +1537,7 @@ static void handleAutoConfig() {
 #ifdef VEBUS_READ_ONLY
     sendJson("{\"ok\":false,\"error\":\"Nur-Lesen-Firmware\"}",403);return;
 #endif
+    double offset=autoCfg.dischargeOffsetW;
     double source=autoCfg.useMqtt?1:0,boost=autoCfg.boostEnabled?1:0,boostSoc=autoCfg.boostMinSoc;
     double soc=autoCfg.bydMinSoc,wakeW=autoCfg.wakeMinW,wakeS=autoCfg.wakeDelayS,sleep=autoCfg.sleepAtCutoff?1:0;
     double factor=autoCfg.correctionFactor,cap=autoCfg.correctionMaxV,floorV=autoCfg.hardFloorV;
@@ -1578,7 +1547,8 @@ static void handleAutoConfig() {
         if(enteredFactor>0&&enteredFloor==0){sendJson("{\"ok\":false,\"error\":\"Nicht gespeichert: Lastkorrektur benötigt eine unkompensierte Untergrenze zwischen 38 V und der Stoppspannung. Untergrenze 0 ist nur bei Faktor 0 erlaubt.\"}",400);return;}
         if(enteredFloor!=0&&(enteredFloor<38||enteredFloor>enteredCut)){sendJson("{\"ok\":false,\"error\":\"Nicht gespeichert: Unkompensierte Untergrenze muss zwischen 38 V und der Stoppspannung liegen.\"}",400);return;}
     }
-    if((server.hasArg("mqtt_source")&&!autoNumber("mqtt_source",source))||(source!=0&&source!=1)||
+    if((server.hasArg("discharge_offset_w")&&!autoNumber("discharge_offset_w",offset))||offset<0||offset>500||floor(offset)!=offset||
+       (server.hasArg("mqtt_source")&&!autoNumber("mqtt_source",source))||(source!=0&&source!=1)||
        (server.hasArg("boost_enabled")&&!autoNumber("boost_enabled",boost))||(boost!=0&&boost!=1)||
        (server.hasArg("boost_min_soc")&&!autoNumber("boost_min_soc",boostSoc))||boostSoc<0||boostSoc>100||floor(boostSoc)!=boostSoc||
        (server.hasArg("voltage_correction_factor")&&!autoNumber("voltage_correction_factor",factor))||factor<0||factor>.005||
@@ -1606,12 +1576,13 @@ static void handleAutoConfig() {
     autoCfg.sleepAtCutoff=sleep==1;autoCfg.bydMinSoc=soc;autoCfg.wakeMinW=wakeW;autoCfg.wakeDelayS=wakeS;
     autoSurplusTimer.reset();
     autoCfg.bydThresholdW=byd;autoCfg.dataTimeoutS=wait;
+    autoCfg.dischargeOffsetW=offset;
     autoCfg.sharePct=share;autoCfg.chargeW=charge;autoCfg.dischargeW=discharge;autoCfg.cutoffV=cutoff;autoCfg.resumeDeltaV=delta;
     updateVoltageGuard();saveConfig();
     if(autoEnabled) {
         // Reductions take effect immediately; increases retain the existing ramp.
-        if(g_essPower>0 && autoHaveSample && autoSample.valid && millis()-autoSample.atMs<=15000) {
-            autoWanted=AutoPower::target(autoSample.demandW,autoSample.otherW,autoCfg.chargeW,autoCfg.dischargeW,autoCfg.sharePct,autoCfg.bydThresholdW);
+        if(g_essPower>0 && autoHaveSample && autoSample.valid && millis()-autoSample.atMs<=autoFreshWindow()) {
+            autoWanted=AutoPower::target(autoSample.demandW,autoSample.otherW,autoCfg.chargeW,autoCfg.dischargeW,autoCfg.sharePct,autoCfg.bydThresholdW,autoCfg.dischargeOffsetW);
             autoSetPower(min((int)g_essPower,max(0,autoWanted)));
         } else if(g_essPower<0 && !AutoPower::priorityReady(autoCfg.bydMinSoc,autoSample.bydSocValid,autoSample.bydSoc))autoSetPower(0);
         else autoSetPower(g_essPower);
@@ -1976,7 +1947,6 @@ void setup()
     if (!acRows) Serial.println("[battery-log] CSV allocation failed; measurement start blocked");
 
     loadConfig();
-    loadRestartBudget();
     voltageBlocked=autoCfg.cutoffV>0; // conservative restart: release at cutoff + hysteresis
     loadEnergy();
 
@@ -2059,6 +2029,7 @@ void loop()
 
     esp_task_wdt_reset();
     uint32_t now = millis();
+    restartBudget.update(now);
 
     STAGE(ST_WIFI);
     superviseWiFi(now);
@@ -2093,9 +2064,11 @@ void loop()
     updateVoltageGuard();
     autoLoop(millis());
 
+    // Web/MQTT/automation may have advanced the clock and refreshed the command.
+    now = millis();
     // ESS fail-safe: no fresh setpoint for essTimeoutS → back to 0 W
     if (cfg.essTimeoutS && g_essPower != 0 &&
-        now - g_lastEssCmdMs >= (uint32_t)cfg.essTimeoutS * 1000UL)
+        EssTimeout::expired(now,g_lastEssCmdMs,cfg.essTimeoutS))
     {
         g_essPower = 0;
         vebus.setESSPower(0);

@@ -11,9 +11,9 @@ constexpr int bounded(int w, int chargeLimit = LIMIT, int dischargeLimit = LIMIT
 constexpr bool inputsFresh(bool valid, uint32_t ageMs, bool wifi, bool ac, bool battery, bool tx) {
     return valid && ageMs <= 15000 && wifi && ac && battery && tx;
 }
-constexpr int target(int residualW, int otherBatteryW, int chargeLimit = LIMIT, int dischargeLimit = LIMIT, unsigned sharePct = 90, int bydThreshold = 100) {
+constexpr int target(int residualW, int otherBatteryW, int chargeLimit = LIMIT, int dischargeLimit = LIMIT, unsigned sharePct = 90, int bydThreshold = 100, int dischargeOffsetW = 0) {
     return residualW > DEADBAND
-        ? (otherBatteryW < -150 ? 0 : bounded(residualW * (int)sharePct / 100, chargeLimit, dischargeLimit))
+        ? (otherBatteryW < -150 || sharePct == 0 ? 0 : bounded(residualW * (int)sharePct / 100 + dischargeOffsetW, chargeLimit, dischargeLimit))
         : residualW < -DEADBAND
           ? (otherBatteryW > bydThreshold ? 0 : bounded(residualW + CHARGE_RESERVE, chargeLimit, dischargeLimit)) : 0;
 }

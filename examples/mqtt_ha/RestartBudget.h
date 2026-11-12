@@ -1,25 +1,32 @@
 #pragma once
 #include <stdint.h>
 
-// One NVS blob per reserved attempt. Calendar date is supplied in Europe/Berlin.
+// RAM only: two attempts in a rolling hour, with 30-minute spacing.
+// Advance ages on each controller loop/API call, including millis() rollover.
 struct RestartBudget {
-    struct Record {uint32_t day=0,count=0,lastEpoch=0;} record;
-    static bool valid(const Record &r){
-        return (!r.day&&!r.count&&!r.lastEpoch)||
-            (r.day>=20240101&&r.day<=21001231&&r.count>=1&&r.count<=2&&r.lastEpoch>=1704067200UL);
+    uint32_t ages[2]={0,0},lastMs=0;
+    uint8_t used=0;
+    void update(uint32_t now){
+        const uint32_t elapsed=now-lastMs;
+        if(used&&elapsed>0x7fffffffUL)return; // Ignore an older loop timestamp after an API read.
+        lastMs=now;
+        uint8_t keep=0;
+        for(uint8_t i=0;i<used;++i){
+            if(elapsed>=3600000UL-ages[i])continue;
+            ages[keep++]=ages[i]+elapsed;
+        }
+        used=keep;
     }
-    uint32_t count(uint32_t day)const{return day&&day>record.day?0:record.count;}
-    uint32_t cooldown(uint32_t epoch)const{
-        if(!record.lastEpoch)return 0;
-        if(epoch<record.lastEpoch)return 1800;
-        const uint32_t elapsed=epoch-record.lastEpoch;return elapsed>=1800?0:1800-elapsed;
+    uint32_t count(uint32_t now){update(now);return used;}
+    uint32_t cooldown(uint32_t now){
+        update(now);uint32_t wait=0;
+        if(used&&ages[used-1]<1800000UL)wait=1800000UL-ages[used-1];
+        if(used>=2&&3600000UL-ages[0]>wait)wait=3600000UL-ages[0];
+        return (wait+999)/1000;
     }
-    bool available(uint32_t day,uint32_t epoch)const{
-        return day>=20240101&&day<=21001231&&epoch>=1704067200UL&&epoch<=4102444799UL&&day>=record.day&&
-            count(day)<2&&!cooldown(epoch);
-    }
-    bool reserve(uint32_t day,uint32_t epoch){
-        if(!available(day,epoch))return false;
-        record.count=count(day)+1;record.day=day;record.lastEpoch=epoch;return true;
+    bool available(uint32_t now){return cooldown(now)==0;}
+    bool reserve(uint32_t now){
+        if(!available(now))return false;
+        ages[used++]=0;return true;
     }
 };

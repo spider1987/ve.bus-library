@@ -17,9 +17,9 @@ c.renderOperating(null,null);assert.equal(get('operatingMode').textContent,'Nich
 assert(source.includes('Interne ESS-Sperren'));
 console.log('Operating status: mode, simultaneous locks, missing data and unknown internal ESS state OK');
 
-c.renderOperating(s,{enabled:true,fresh:true,status:'Entladen',restart_today:2,restart_daily_limit:2,restart_limit_status:'Tageslimit erreicht',restart_cooldown_s:120});
+c.renderOperating(s,{enabled:true,fresh:true,status:'Entladen',restart_last_hour:2,restart_hourly_limit:2,restart_limit_status:'Stundenlimit erreicht',restart_cooldown_s:120});
 assert(get('operatingRestarts').textContent==='2 von 2');
-assert(get('operatingRestartInfo').textContent.includes('Tageslimit erreicht'));
+assert(get('operatingRestartInfo').textContent.includes('Stundenlimit erreicht'));
 assert(get('operatingRestartInfo').textContent.includes('in 2 min'));
 
 c.renderOperating({...s,mains_power:475},{enabled:true,fresh:true,status:'Entladen · eingestellter Victron-Anteil',share_pct:90,demand_w:582,target_w:523,discharge_limit_w:4000});
@@ -34,4 +34,4 @@ c.renderOperating(s,{boost_supporting:true,share_pct:80,target_w:4000,discharge_
 assert.equal(get('operatingShare').textContent,'100 %');
 c.renderOperating(null,null);assert.equal(get('operatingShare').textContent,'—');assert.equal(get('operatingMeasured').textContent,'—');
 
-assert(source.includes('Wechselrichter-Neustarts heute'));assert(source.includes('/style.css?v=status-layout-3'));
+assert(source.includes('Wechselrichter-Neustarts · letzte Stunde'));assert(/\/style\.css\?v=[\w-]+/.test(source));

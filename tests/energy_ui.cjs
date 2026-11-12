@@ -41,6 +41,13 @@ const fn = src.slice(a, b);
       valid ? "2,400 kWh" : "—",
     );
     assert.equal(els.energyTotalDischarge.textContent, "24,000 kWh");
+    assert.equal(els.energyTotalDifference.textContent, "6,000 kWh");
+    state.total_charge_kwh = null;
+    await vm.runInContext("energyPoll()", c);
+    assert.equal(els.energyTotalDifference.textContent, "—");
+    state.total_charge_kwh = 20;
+    await vm.runInContext("energyPoll()", c);
+    assert.equal(els.energyTotalDifference.textContent, "-4,000 kWh");
     assert.equal(els.energyMqtt.textContent, state.mqtt_topic);
     assert(els.energyDays.innerHTML.includes("2,400"));
     if (!valid)

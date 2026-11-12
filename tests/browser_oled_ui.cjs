@@ -317,6 +317,11 @@ const pause = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
             );
           }
         }
+        if(route === "/admin/#automatik"){
+          const grouped=await call("Runtime.evaluate",{expression:"JSON.stringify({groups:document.querySelectorAll('#autoSettings>details.auto-group').length,visible:document.getElementById('autoDischargeOffset').getBoundingClientRect().height>0,value:document.getElementById('autoDischargeOffset').value})",returnByValue:true});
+          const data=JSON.parse(grouped.result.result.value);assert.equal(data.groups,6);assert(data.visible);assert.equal(data.value,'0');
+          if(width===1920||width===390){const shot=await call("Page.captureScreenshot",{captureBeyondViewport:false});fs.writeFileSync(path.join(out,'automation-groups-'+width+'.png'),Buffer.from(shot.result.data,'base64'));}
+        }
         if (route === "/") {
           assert.equal(v.tiles, 6);
           assert(v.blackTiles);

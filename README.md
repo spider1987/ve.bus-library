@@ -1293,25 +1293,15 @@ Der effektive ESS-Sollwert bleibt eine angeforderte Leistung, keine
 Empfangs- oder Leistungsbestätigung des MultiPlus. Die Wirkung des neuen
 ON-Ablaufs muss nach Installation am Gerät geprüft werden.
 
-## Automatischer Menü-Aus-/Ein-Zyklus mit Tageslimit
+## Automatischer Menü-Aus-/Ein-Zyklus mit Stundenlimit
 
-Wenn trotz mindestens 200 W Sollwert 120 Sekunden lang weniger als 50 W AC-
-und DC-Entladung gemessen werden, kann die Automatik maximal zweimal pro Kalendertag (Europe/Berlin)
-Aus und Ein anfordern, mit mindestens 30 Minuten Abstand zwischen den Versuchen.
-Tagesdatum, Zähler und letzter Versuchszeitpunkt werden gemeinsam in NVS
-reserviert und zurückgelesen, bevor Aus angefordert wird. Abgebrochene Versuche
-zählen mit. Neustarts des LILYGO oder Ein-/Ausschalten der Automatik setzen
-weder den Zähler noch den Abstand zurück. Der Abstand gilt auch über Mitternacht.
-Ohne gültige Uhrzeit, bei zurückspringender Zeit oder fehlerhaftem Speicher
-wird kein neuer Zyklus gestartet. Ein neuer Tag wird erst mit gültiger,
-vorwärts laufender Uhrzeit anerkannt.
-
-Voraussetzungen: Betriebsart zuvor Ein, aktuelle lokale/evcc-Messwerte,
-konfigurierte Spannungssperre (>0), gemessene Spannung mindestens Abschaltgrenze
-plus Wiederfreigabeabstand, keine eigene Spannungssperre und keine Überlast-,
-Temperatur- oder Low-Battery-LED. Das fehlende DC-Freigabebit ist bei diesem
-gezielt autorisierten Wiederanlauf kein Ausschlussgrund; es wird weder
-überschrieben noch als vorhanden ausgegeben.
+Bei mindestens zwei Minuten ausbleibender Entladung trotz freigegebener
+Anforderung kann die Automatik maximal zwei Versuche in den letzten 60 Minuten
+starten. Zwischen Versuchen liegen mindestens 30 Minuten. Auch abgebrochene
+Versuche zählen. Der Zähler liegt nur im RAM: Ein LILYGO-Neustart setzt ihn zurück;
+Ein-/Ausschalten der Automatik setzt ihn nicht zurück. Die Zeitmessung benötigt
+keine Netzzeit und berücksichtigt den Überlauf von millis(). Bestehende Prüfungen
+auf frische Messwerte, Spannungsschutz, Entladebedarf und Alarme bleiben erhalten.
 
 Der Ablauf hält den Sollwert auf 0 W, fordert Aus an, wartet maximal 20 s auf
 Rückmeldung, wartet danach 10 s und fordert Ein an. Anschließend müssen innerhalb
@@ -1325,9 +1315,9 @@ auf. Nach Abbruch ist gegebenenfalls eine manuelle Einschaltung erforderlich.
 
 AC-OUT kann dabei unterbrochen werden. Dies ist der Menü-Schaltvorgang, kein
 vollständiger Strom-/Elektronik-Neustart. Interne Schutzbedingungen bleiben
-wirksam. API `/api/auto`: `restart_used`, `restart_active`, `restart_status`, `restart_today`,
-`restart_daily_limit`, `restart_day`, `restart_cooldown_s`, `restart_clock_valid`,
-`restart_storage_ok` und `restart_limit_status`.
+wirksam. API `/api/auto`: `restart_used`, `restart_active`, `restart_status`, `restart_last_hour`,
+`restart_hourly_limit`, `restart_window_s`, `restart_cooldown_s`,
+`restart_reset_on_boot` und `restart_limit_status`.
 Status und Ergebnis erscheinen unter den Live-Messwerten. Hardwarewirkung
 muss nach Installation geprüft werden.
 
@@ -1347,3 +1337,80 @@ Unter jedem Diagramm stehen die letzten gültigen Minutenmittelwerte und deren
 Zeitpunkt. Die Werte sind unabhängig vom gewählten Diagramm-Zoom; ältere Daten
 außerhalb des 24-h-Fensters werden nicht als letzte Messung angezeigt. Fehlende
 Einzelfelder bleiben „—“, Nullwerte bleiben echte Nullwerte.
+
+### Einstellbarer Entladeaufschlag und Automatik-Menüs
+
+Unter Einstellungen → evcc-Automatik → Leistung & Netzausgleich kann eine
+zusätzliche Entladeleistung von 0 bis 500 W eingestellt werden. Standard 0 W
+belässt das bisherige Verhalten. Rechnung bei freigegebener Entladung:
+`Bedarf nach Solar × Anteil / 100 + Aufschlag`, begrenzt durch die maximale
+Entladeleistung. Beispiel: 500 W × 100 % + 50 W = 550 W. Bei 90 % ergeben sich
+500 W; ein konstanter Aufschlag ersetzt daher keinen Anteil von 100 %, wenn
+möglichst der ganze Bedarf gedeckt werden soll. Der Aufschlag ist ein fester
+Vorsteuerwert, kein garantierter Netz-Sollwert; GoodWe/BYD kann parallel regeln.
+
+Kein Aufschlag bei PV-Überschuss, Totzone, BYD-Ladung über der bisherigen
+Entladesperre oder ausgeschalteter Entladerichtung. 0 % deaktiviert die normale
+Entladung; ein freigegebener Batterie-Boost nutzt weiterhin 100 % Anteil.
+Alle Spannungs-, Daten-, Betriebsart- und Leistungsgrenzen bleiben bestehen.
+Der Aufschlag gilt auch für freigegebenen Boost und die konsistente
+Neustart-Bedarfsprüfung. Absenkungen wirken sofort, Erhöhungen folgen der Rampe.
+Es wurden keine Einstellungen am physischen Gerät geändert.
+
+API GET `/api/auto` und POST `/admin/api/auto/config`: `discharge_offset_w`.
+Der POST-Parameter ist optional für ältere Clients, sonst 0..500 als ganze Watt.
+NVS: `autoextra` als unsigned short, Speichern mit Rückleseprüfung.
+Reguläres MQTT-/HTTP-State-Feld: `auto_discharge_offset_w`.
+
+Die Automatik-Einstellungen sind in sechs native aufklappbare Gruppen geordnet:
+Leistung/Netzausgleich, PV/BYD-Priorität, Batterie-Boost, Batterieschutz und
+Lastkorrektur, Abschaltung/Wiederanlauf/Neustarts sowie Datenquelle/Verbindung.
+Alle Gruppen gehören zu einem Formular. Der gemeinsame Speicherknopf bleibt
+außerhalb der Gruppen sichtbar; laufende Abfragen überschreiben keine Eingaben.
+
+### Live-Vorschau der Spannungskorrektur
+
+In Batterieschutz & Lastkorrektur rechnet die Vorschau bei jeder Eingabe und
+jedem neuen Batteriemesswert mit den aktuell eingetragenen Werten:
+`gemessene Spannung + min(DC-Entladeleistung × Faktor, maximale Korrektur)`.
+Bei ausgeschalteter Spannungssperre wird keine Korrektur vorgerechnet; beim
+Laden liefert die API eine DC-Entladeleistung von 0 W. Beispiel: 47,58 V und
+366 W mit 0,002 V/W ergeben 0,732 V Korrektur bzw. 48,31 V Anzeige.
+Die Wiederfreigabe wird als eingestellte Stoppspannung plus Abstand
+angezeigt und bezieht sich auf die tatsächlich gemessene Spannung. Eine bestehende Verriegelung oder interne ESS-Sperre wird durch die
+Vorschau nicht freigegeben.
+
+Die Vorschau ist ausdrücklich keine Steuerung. Ungespeicherte Änderungen sind
+markiert; darunter stehen die vom Gerät gemeldeten tatsächlich wirksamen Werte.
+Erst Einstellungen speichern übernimmt die Parameter. Ungültige/fehlende
+Eingaben oder länger als 10 Sekunden alte lokale Messwerte ergeben kein
+hypothetisches Freigabesignal; Verbindungsfehler zeigen unbekannte Werte.
+
+### Gemessene Stoppspannung unter aktueller Last
+
+Die Vorschau zeigt die gesuchte lastabhängige Spannung separat und groß:
+`max(unkompensierte Untergrenze, eingestellte Stoppschwelle − aktuelle Korrektur)`.
+Bei deaktivierter Untergrenze gilt nur der zweite Term. Die Korrektur wird aus
+aktueller DC-Entladeleistung × Eingabefaktor berechnet und durch die eingetragene
+maximale Korrektur begrenzt. Beispiel bei 485 W und 0,001 V/W: 46,5 V Schwelle
+führt rechnerisch zu 46,015 V (Anzeige 46,02 V); 46,0 V zu 45,515 V (45,52 V).
+Eine Untergrenze 45,5 V begrenzt ein weiteres Absenken entsprechend.
+
+Das ist die momentane Auslösegrenze der eigenen Software-Spannungssperre bei der
+aktuellen DC-Leistung, keine unabhängig von der Last gültige Akkugrenze und
+keine Zusage, dass interne MultiPlus-/BMS-Sperren aufgehoben werden. Eine bereits
+verriegelte Software-Sperre gibt erst bei gemessener Spannung ab ursprünglicher
+Stoppschwelle plus Wiederfreigabeabstand frei. Die große Anzeige ist nur eine
+Vorschau; unveränderte Steuerlogik und Speichern bleiben getrennt.
+
+
+### Sollwert während UI-Bedienung und MQTT-Datenlücken
+
+Die ESS-Zeitüberwachung liest die Uhr nach Web-/MQTT-Verarbeitung und der
+Automatik neu ein. Ein gerade erneuerter Sollwert darf nicht durch einen älteren
+Schleifen-Zeitstempel als abgelaufen gelten. Ein MQTT-Abbruch hält den letzten
+Auftrag nur innerhalb der eingestellten evcc-Datenzeit, gerechnet ab dem letzten
+vollständigen Messsatz. Danach wird 0 W gesetzt. Neue gültige Werte können den
+Auftrag vorher reduzieren; lokale VE.Bus-Frische und Spannungsschutz bleiben
+unmittelbar wirksam. Seitenwechsel und ungespeicherte Eingaben senden keinen
+Steuerbefehl.

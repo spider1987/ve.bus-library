@@ -1,7 +1,7 @@
 #pragma once
 #include <stdint.h>
 
-// OFF/ON state machine; persistent daily limits are enforced by RestartBudget.
+// OFF/ON state machine; RAM-only hourly limits are enforced by RestartBudget.
 struct EssRestart {
     enum Phase {Idle,WaitOff,OffDelay,WaitOn,Done,Aborted};
     enum Action {None,SendOff,SendOn,Stop};
